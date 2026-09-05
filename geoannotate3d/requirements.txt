@@ -1,0 +1,30 @@
+# GeoAnnotate3D — dependencias v3.0
+# pip install -r requirements.txt
+
+# GUI
+PyQt5>=5.15.0
+# (incluye PyQt5.QtSvg, usado por ui/icons.py para los iconos reales de
+#  la interfaz — Bootstrap Icons, ver ui/icons/LICENSE.txt)
+
+# Render 3D (C++ OpenGL via VTK)
+vtk>=9.2.0
+
+# Colormaps
+matplotlib>=3.5.0
+
+# Arrays
+numpy>=1.24.0
+
+# Nubes de puntos
+laspy[lazrs]>=2.4.0
+
+# E57 format
+pye57>=0.4.0
+
+# Aceleración de queries espaciales (cKDTree, sphere query)
+scipy>=1.9.0
+
+# Opcionales — mejoras de rendimiento
+h5py>=3.8.0          # exportar .h5 para PointNet++
+open3d>=0.17.0       # cargar PLY grandes más rápido
+psutil>=5.9.0        # detección dinámica de RAM disponible
