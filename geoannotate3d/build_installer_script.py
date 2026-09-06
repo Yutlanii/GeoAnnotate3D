@@ -18,7 +18,7 @@ OUTPUT_DIR = r"installer"
 APP_NAME   = "GeoAnnotate3D"
 APP_VER    = "1.0.0"
 APP_PUBLISHER = "GeoAnnotate3D"
-APP_URL    = "https://github.com/geoannotate3d"   # cambiar cuando tengas GitHub
+APP_URL    = "https://github.com/Yutlanii/GeoAnnotate3D"
 APP_ICON   = r"ui\icon.ico"
 APP_EXE    = "GeoAnnotate3D.exe"
 
