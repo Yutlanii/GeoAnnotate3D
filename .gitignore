@@ -6,6 +6,7 @@ __pycache__/
 # Local user state / caches (not part of the source tree)
 .geoannotate_recent.json
 geoannotate3d/.geoannotate_recent.json
+colormap_tmp.json
 *.zip
 
 # Editor
