@@ -17,6 +17,13 @@ colormap_tmp.json
 build/
 dist/
 *.spec
+nuitka_build.log
+nuitka_build.log.err
+nuitka_pid.txt
+nuitka-crash-report.xml
+installer_setup.iss
+build_cache/
+installer/
 
 # Point-cloud cache files generated at runtime (mmap caches, LOD caches)
 *.xyzcache
