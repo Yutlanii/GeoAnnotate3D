@@ -97,13 +97,13 @@ Download the Windows installer from the [Releases section](https://github.com/Yu
 
 **[GeoAnnotate3D_Setup_v1.0.0.exe](https://github.com/Yutlanii/GeoAnnotate3D/releases/latest)**
 
-The installer includes Python, PyTorch, and all required dependencies. No additional setup needed.
+The installer bundles Python, PyTorch (CUDA build), and every dependency needed — no separate setup, no internet access required at first launch. Because a CUDA-capable PyTorch is included so the same installer works with or without an NVIDIA GPU, the download is large (multiple GB).
 
 **System Requirements:**
 - Windows 10/11 (64-bit)
 - 8 GB RAM minimum (16 GB recommended)
-- NVIDIA GPU with CUDA 12.x (optional, accelerates training)
-- 5 GB disk space
+- ~6 GB disk space
+- NVIDIA GPU with CUDA 12.x (optional — accelerates training; the app runs on CPU otherwise, just slower)
 
 ---
 
@@ -114,7 +114,7 @@ The installer includes Python, PyTorch, and all required dependencies. No additi
 3. Follow the setup wizard
 4. Open GeoAnnotate3D from the Start Menu or desktop shortcut
 
-On first launch, the software will automatically download PyTorch (CUDA build if an NVIDIA GPU is detected, CPU build otherwise). This may take 5 to 15 minutes depending on your connection.
+Everything needed is already inside the installer — there's nothing to download or configure on first launch.
 
 ---
 
