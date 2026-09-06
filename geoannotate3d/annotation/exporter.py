@@ -31,6 +31,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from annotation.label_store import DELETED_LABEL
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuración
@@ -186,7 +188,11 @@ class ExportWorker(QThread):
 
         if self._tm is None:
             # Sin tile manager: dividir la nube en 3 segmentos espaciales (train/val/test)
-            mask = labels > 0 if self._config.only_labeled else np.ones(len(labels), bool)
+            # Los puntos eliminados (DELETED_LABEL, ver label_store.py) se
+            # excluyen SIEMPRE, sin importar only_labeled — no son "puntos
+            # sin etiquetar", son puntos que el usuario sacó de la nube.
+            not_deleted = labels != DELETED_LABEL
+            mask = (labels > 0) & not_deleted if self._config.only_labeled else not_deleted
             idx  = np.where(mask)[0]
             if len(idx) == 0:
                 return []
@@ -212,13 +218,14 @@ class ExportWorker(QThread):
             idx = self._tm.get_tile_indices_fast(tile)
             if idx is None or len(idx) == 0:
                 continue
-            # Filtrar solo etiquetados si se pide
+            # Puntos eliminados: fuera siempre, sin importar only_labeled
+            # (ver nota equivalente arriba, rama sin tile manager).
             lbl_tile = labels[idx]
-            if self._config.only_labeled:
-                mask = lbl_tile > 0
-                idx  = idx[mask]
-                if len(idx) == 0:
-                    continue
+            not_deleted = lbl_tile != DELETED_LABEL
+            mask = (lbl_tile > 0) & not_deleted if self._config.only_labeled else not_deleted
+            idx  = idx[mask]
+            if len(idx) == 0:
+                continue
             center = np.array([
                 (tile.min_xr + tile.max_xr) * 0.5,
                 (tile.min_yr + tile.max_yr) * 0.5,
@@ -1118,16 +1125,20 @@ class ExportWorker(QThread):
         if pc is None or pc.xyz is None or lbl is None:
             return
         try:
+            # Puntos eliminados (DELETED_LABEL, ver label_store.py) se
+            # excluyen del .las clasificado — son puntos que el usuario
+            # sacó de la nube, no deben reaparecer en ningún export.
+            keep = np.where(lbl != DELETED_LABEL)[0]
             offset = pc.offset
-            x = pc.xyz[:, 0].astype(np.float64) + offset[0]
-            y = pc.xyz[:, 1].astype(np.float64) + offset[1]
-            z = pc.xyz[:, 2].astype(np.float64) + offset[2]
+            x = pc.xyz[keep, 0].astype(np.float64) + offset[0]
+            y = pc.xyz[keep, 1].astype(np.float64) + offset[1]
+            z = pc.xyz[keep, 2].astype(np.float64) + offset[2]
             hdr = laspy.LasHeader(point_format=0, version="1.4")
             hdr.offsets = np.array([x.min(), y.min(), z.min()])
             hdr.scales  = np.array([0.001, 0.001, 0.001])
             las = laspy.LasData(header=hdr)
             las.x = x; las.y = y; las.z = z
-            out_lbl = lbl.astype(np.uint8)
+            out_lbl = lbl[keep].astype(np.uint8)
             if getattr(self._config, "asprs_codes", False) and self._project is not None:
                 # Remapear cada class_id presente a su código ASPRS (o
                 # 64+id si no se reconoce el nombre) — una tabla de
@@ -1140,7 +1151,7 @@ class ExportWorker(QThread):
                 out_lbl = lut[np.clip(out_lbl, 0, 255)]
             las.classification = out_lbl
             if pc.intensity is not None:
-                las.intensity = (pc.intensity * 65535).astype(np.uint16)
+                las.intensity = (pc.intensity[keep] * 65535).astype(np.uint16)
             stem = Path(pc.filename).stem if pc.filename else "cloud"
             las.write(str(out / f"{stem}_classified.las"))
         except Exception as e:
@@ -1151,7 +1162,11 @@ class ExportWorker(QThread):
         per_class: Dict[str, int] = {}
         lbl = self._labels
         if lbl is not None:
-            u, c = np.unique(lbl[lbl > 0], return_counts=True)
+            # DELETED_LABEL (255) es > 0 pero no es una clase real — sin
+            # excluirlo aparecía en las estadísticas del dataset como si
+            # fuera una clase de 255 puntos "eliminados".
+            real = lbl[(lbl > 0) & (lbl != DELETED_LABEL)]
+            u, c = np.unique(real, return_counts=True)
             per_class = {str(int(k)): int(v) for k, v in zip(u, c)}
 
         # Calcular class_weights

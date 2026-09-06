@@ -135,6 +135,12 @@ def _enhance_to_u8(rgba_f32, saturation=1.0, brightness=1.0, gamma=1.0):
 # RUTA DIRECTA UINT8 — la cadena principal de rendimiento
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Debe coincidir con DELETED_LABEL en annotation/label_store.py — no se
+# importa de ahí para no crear una dependencia circular render↔annotation;
+# es un valor centinela estable (255, nunca una clase real), no una opción.
+DELETED_LABEL = 255
+
+
 def compute_colors_u8(xyz, attrs, mode, cmap="viridis",
                       z_range=None, annotation_labels=None,
                       annotation_lut_u8=None):
@@ -145,6 +151,23 @@ def compute_colors_u8(xyz, attrs, mode, cmap="viridis",
       Antes: lut_f32[labels] → f32 → *255 → u8 → /255 → f32  (1362ms/15M)
       Ahora: lut_u8[labels] → u8                               (275ms/15M)
     """
+    out = _compute_colors_u8_impl(xyz, attrs, mode, cmap, z_range,
+                                  annotation_labels, annotation_lut_u8)
+    # Puntos eliminados (ver DELETED_LABEL): invisibles en CUALQUIER modo de
+    # color, no solo en "Anotación" — por eso este chequeo vive aquí, fuera
+    # de las ramas por modo, y no dentro de la rama "Anotación" nada más.
+    # alpha=0 evita tocar la geometría de vtkPoints (nada de reindexar/
+    # reconstruir el mapper), coherente con que xyz puede ser un mmap.
+    if annotation_labels is not None:
+        deleted = annotation_labels == DELETED_LABEL
+        if deleted.any():
+            out[deleted, 3] = 0
+    return out
+
+
+def _compute_colors_u8_impl(xyz, attrs, mode, cmap="viridis",
+                            z_range=None, annotation_labels=None,
+                            annotation_lut_u8=None):
     n = len(xyz)
     if n == 0:
         return np.zeros((0,4), np.uint8)
@@ -196,6 +219,17 @@ def compute_colors_u8(xyz, attrs, mode, cmap="viridis",
                 return FC._fc.intensity_colors_u8(iv, lut)
         except Exception: pass
         idx = np.clip((attrs["intensity"] * 255).astype(np.int32), 0, 255)
+        return lut[idx]
+
+    # ── Confianza (post-inferencia) ────────────────────────────────────────────
+    # "Future update" añadido en esta ronda: infer_cloud(..., return_confidence=
+    # True) ya calculaba esto internamente (softmax de los logits promediados)
+    # y lo descartaba, quedándose solo con el argmax — con el mismo cálculo ya
+    # hecho, exponerlo como modo de color es casi gratis, y ayuda a saber dónde
+    # revisar primero después de inferir (rojo = insegura, verde = segura).
+    if mode == "Confianza" and "confidence" in attrs:
+        lut = _get_lut_u8("RdYlGn")
+        idx = np.clip((attrs["confidence"] * 255).astype(np.int32), 0, 255)
         return lut[idx]
 
     # ── Retorno ───────────────────────────────────────────────────────────────
@@ -334,11 +368,15 @@ def build_annotation_lut(schema_list):
     lut = np.full((256,4), [0.92,0.92,0.92,0.45], dtype=np.float32)
     for sc in schema_list:
         idx = int(sc.id)
-        if 0 <= idx <= 255:
+        if 0 <= idx < DELETED_LABEL:   # 255 nunca es una clase real, ver DELETED_LABEL
             h = sc.color.lstrip("#")
             r,g,b = int(h[0:2],16)/255., int(h[2:4],16)/255., int(h[4:6],16)/255.
             lut[idx] = [r,g,b,1.0]
     lut[0] = [0.92,0.92,0.92,0.45]
+    # Defensa en profundidad: compute_colors_u8() ya enmascara alpha=0 para
+    # puntos eliminados en CUALQUIER modo, esto solo cubre por si algo usa
+    # la LUT directamente sin pasar por ese wrapper.
+    lut[DELETED_LABEL] = [0.0, 0.0, 0.0, 0.0]
     return lut
 
 
@@ -347,9 +385,10 @@ def build_annotation_lut_u8(schema_list):
     lut = np.full((256,4), [235,235,235,115], dtype=np.uint8)
     for sc in schema_list:
         idx = int(sc.id)
-        if 0 <= idx <= 255:
+        if 0 <= idx < DELETED_LABEL:   # 255 nunca es una clase real, ver DELETED_LABEL
             h = sc.color.lstrip("#")
             r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
             lut[idx] = [r,g,b,255]
     lut[0] = [235,235,235,115]
+    lut[DELETED_LABEL] = [0, 0, 0, 0]
     return lut

@@ -759,6 +759,7 @@ class MainWindow(QMainWindow):
         self._tool_panel.show_unlabeled_toggled.connect(self._on_show_unlabeled)
         # v2.0: nuevas herramientas
         self._tool_panel.erase_mode_changed.connect(self._on_erase_mode_changed)
+        self._tool_panel.delete_mode_changed.connect(self._on_delete_mode_changed)
         self._tool_panel.only_unlabeled_changed.connect(self._on_only_unlabeled_changed)
 
         # Geo panel
@@ -786,6 +787,7 @@ class MainWindow(QMainWindow):
         self._tile_panel.tile_size_changed.connect(self._on_tile_size_changed)
         self._tile_panel.transform_changed.connect(self._on_tile_transform_changed)
         self._tile_panel.grid_edit_mode_changed.connect(self._on_grid_edit_mode_changed)
+        self._tile_panel.load_cloud_requested.connect(self.new_project)
         self._canvas.sig.tile_hovered.connect(self._on_canvas_tile_hover)
         # v3.0: nuevas señales
         # Feature 1: hover desde panel 2D → resaltar en canvas 3D
@@ -1203,7 +1205,11 @@ class MainWindow(QMainWindow):
         self._canvas.load_cloud(pc, self._project)
 
         # Auto-select best initial color mode based on cloud data
-        n_labeled = int((self._project.labels > 0).sum()) if self._project.labels is not None else 0
+        # (excluye DELETED_LABEL: puntos eliminados no cuentan como "hay
+        # anotaciones reales" para esta decisión — ver label_store.py)
+        from annotation.label_store import DELETED_LABEL as _DEL
+        n_labeled = int(((self._project.labels > 0) & (self._project.labels != _DEL)).sum()) \
+                    if self._project.labels is not None else 0
         if n_labeled > 0:
             initial_mode = "Anotación"
         elif hasattr(pc, 'rgb') and pc.rgb is not None:
@@ -1492,6 +1498,7 @@ class MainWindow(QMainWindow):
         # Propagar opciones globales al nuevo tool
         if self._active_tool is not None:
             tool.erase_mode     = self._active_tool.erase_mode
+            tool.delete_mode    = self._active_tool.delete_mode
             tool.only_unlabeled = self._active_tool.only_unlabeled
         self._active_tool = tool
         self._canvas.set_active_tool(tool)
@@ -1537,6 +1544,13 @@ class MainWindow(QMainWindow):
 
     def _on_erase_mode_changed(self, v: bool) -> None:
         if self._active_tool: self._active_tool.erase_mode = v
+
+    def _on_delete_mode_changed(self, v: bool) -> None:
+        if self._active_tool: self._active_tool.delete_mode = v
+        if v:
+            self._status.show_message(
+                "Modo eliminar puntos activo — los puntos seleccionados se "
+                "quitan de la nube (Ctrl+Z para deshacer)", timeout=3500)
 
     def _on_only_unlabeled_changed(self, v: bool) -> None:
         if self._active_tool: self._active_tool.only_unlabeled = v
@@ -1727,6 +1741,15 @@ class MainWindow(QMainWindow):
                 new_val = not self._active_tool.erase_mode
                 self._active_tool.erase_mode = new_val
                 self._tool_panel.set_erase_mode(new_val)
+            return
+
+        # Supr/Delete — toggle modo eliminar puntos (saca el punto de la
+        # nube, no solo su clase — ver DELETED_LABEL en label_store.py)
+        if key == Qt.Key_Delete and not mod:
+            if self._active_tool is not None:
+                new_val = not self._active_tool.delete_mode
+                self._active_tool.delete_mode = new_val
+                self._tool_panel.set_delete_mode(new_val)
             return
 
         # Ctrl+T — ir al tab de Tiles
@@ -2144,7 +2167,8 @@ class MainWindow(QMainWindow):
         if self._project is None or self._project.labels is None:
             return
         import numpy as np
-        n_labeled = int((self._project.labels > 0).sum())
+        from annotation.label_store import DELETED_LABEL as _DEL
+        n_labeled = int(((self._project.labels > 0) & (self._project.labels != _DEL)).sum())
         if n_labeled == 0:
             return
         print(f"[Project] Restaurando {n_labeled:,} etiquetas...")
@@ -2170,7 +2194,7 @@ class MainWindow(QMainWindow):
             f"Modelo guardado en:\n{model_path}\n\n"
             "Puedes usarlo en el Paso 6 para inferencia.")
 
-    def _on_inference_done(self, predictions) -> None:
+    def _on_inference_done(self, predictions, confidence=None) -> None:
         import numpy as np
         from PyQt5.QtWidgets import QMessageBox
         if self._pc is None or self._project is None: return
@@ -2179,6 +2203,17 @@ class MainWindow(QMainWindow):
         if len(preds) != n_pts:
             QMessageBox.warning(self, "Inferencia",
                 f"Predicciones ({len(preds):,}) vs nube ({n_pts:,}) no coinciden."); return
+        # Confianza por punto (softmax del modelo) — habilita el modo de
+        # color "Confianza" (rojo=insegura, verde=segura) para saber dónde
+        # revisar primero. No bloqueante: si no viene (p.ej. algún llamador
+        # viejo que aún no la pasa), simplemente no se activa ese modo.
+        if confidence is not None:
+            conf = np.asarray(confidence, dtype=np.float32)
+            if len(conf) == n_pts:
+                self._pc.confidence = conf
+            else:
+                print(f"[Inferencia] confidence ({len(conf):,}) vs nube "
+                      f"({n_pts:,}) no coinciden — se ignora")
         idx_all = np.arange(n_pts, dtype=np.int64)
         for c in range(1, int(preds.max())+1):
             ci = idx_all[preds == c]

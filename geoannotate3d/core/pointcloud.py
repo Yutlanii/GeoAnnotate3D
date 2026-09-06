@@ -37,6 +37,11 @@ class PointCloud:
         self.rgb: Optional[np.ndarray]            = None  # may be np.memmap
         self.classification: Optional[np.ndarray] = None  # may be np.memmap
         self.return_num: Optional[np.ndarray]     = None
+        # Confianza del modelo por punto (0-1), solo presente tras correr
+        # inferencia con return_confidence=True (ver infer.py::infer_cloud).
+        # No viene de ningún archivo — es un resultado derivado, como las
+        # predicciones mismas.
+        self.confidence: Optional[np.ndarray]     = None
         self.offset = np.zeros(3, np.float64)
         self.crs    = ""
         self.bounds: Optional[np.ndarray] = None
@@ -73,6 +78,7 @@ class PointCloud:
         if self.rgb            is not None: d["rgb"]            = self.rgb[idx]
         if self.classification is not None: d["classification"] = self.classification[idx]
         if self.return_num     is not None: d["return_num"]     = self.return_num[idx]
+        if self.confidence     is not None: d["confidence"]     = self.confidence[idx]
         return d
 
     @property

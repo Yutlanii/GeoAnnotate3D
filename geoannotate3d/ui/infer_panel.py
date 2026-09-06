@@ -40,7 +40,7 @@ class InferWorker(QThread):
     """Corre la inferencia en background usando infer.py como librería."""
     progress    = pyqtSignal(float)       # 0-100
     log_line    = pyqtSignal(str)
-    finished_ok = pyqtSignal(object)      # np.ndarray de predicciones (N,)
+    finished_ok = pyqtSignal(object, object)  # (predictions (N,) uint8, confidence (N,) float32|None)
     error       = pyqtSignal(str)
 
     def __init__(self, config: dict):
@@ -108,21 +108,23 @@ class InferWorker(QThread):
         import builtins; builtins.print = _my_print
 
         try:
-            predictions = infer_mod.infer_cloud(
+            predictions, confidence = infer_mod.infer_cloud(
                 model, cloud,
                 num_classes = num_classes,
                 pts         = cfg["pts"],
                 overlap     = cfg["overlap"],
                 batch_size  = cfg["batch"],
                 device      = device,
+                return_confidence = True,
             )
         finally:
             builtins.print = _orig_print
 
         self.progress.emit(100.0)
         self.log_line.emit(f"[Inferencia] Completada — {int((predictions>0).sum()):,} "
-                           f"puntos clasificados")
-        self.finished_ok.emit(predictions)
+                           f"puntos clasificados · confianza media "
+                           f"{float(confidence.mean()):.0%}")
+        self.finished_ok.emit(predictions, confidence)
 
 
 # ── Worker de inferencia por lote (carpeta completa) ───────────────────────────
@@ -214,10 +216,11 @@ class BatchInferWorker(QThread):
 class InferPanel(QWidget):
     """
     Panel a pantalla completa (igual que TrainingPanel).
-    Emite inference_done(np.ndarray) cuando termina para que
-    main_window aplique las predicciones al label_store.
+    Emite inference_done(predictions, confidence) cuando termina para que
+    main_window aplique las predicciones al label_store y guarde la
+    confianza en pc.confidence (habilita el modo de color "Confianza").
     """
-    inference_done = pyqtSignal(object)   # np.ndarray (N,) uint8
+    inference_done = pyqtSignal(object, object)   # predictions (N,) uint8, confidence (N,) float32
     inference_stop = pyqtSignal()
 
     # Estilos reutilizables
@@ -635,7 +638,7 @@ class InferPanel(QWidget):
         self._log.append(line)
         self._log.moveCursor(self._log.textCursor().End)
 
-    def _on_done(self, predictions: np.ndarray):
+    def _on_done(self, predictions: np.ndarray, confidence: np.ndarray):
         self._timer.stop()
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
@@ -643,7 +646,7 @@ class InferPanel(QWidget):
         elapsed = time.time() - self._start_t
         self._log.append(f"\n✓ Inferencia completada en {elapsed:.0f}s")
         self._log.append("Aplicando predicciones al canvas…")
-        self.inference_done.emit(predictions)
+        self.inference_done.emit(predictions, confidence)
 
     def _on_error(self, msg: str):
         self._timer.stop()

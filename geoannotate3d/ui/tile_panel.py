@@ -16,12 +16,12 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QComboBox, QSizePolicy, QFrame,
+    QScrollArea, QComboBox, QSizePolicy, QFrame, QStackedWidget,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QSize, QRect, QPoint
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics
 
-from ui.icons import icon as qicon
+from ui.icons import icon as qicon, pixmap as qpixmap
 from ui.theme import (
     SURFACE, SURFACE_2, SURFACE_3, BORDER, BORDER_SOFT,
     TEXT, TEXT_DIM, TEXT_MUTE,
@@ -224,6 +224,7 @@ class TilePanel(QWidget):
     transform_changed      = pyqtSignal(float, float, float)
     tile_hover_2d          = pyqtSignal(object)
     grid_edit_mode_changed = pyqtSignal(str)
+    load_cloud_requested   = pyqtSignal()   # "Cargar nube" del estado vacío
 
     TILE_SIZES = [10, 25, 50, 100, 200, 500]
 
@@ -251,6 +252,71 @@ class TilePanel(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Antes, este panel mostraba SIEMPRE la barra de "Tamaño de tile" +
+        # una grilla vacía con solo el texto "Sin nube cargada" — controles
+        # para algo que todavía no existe, sin ningún llamado a la acción.
+        # Pedido explícito del usuario: la pantalla donde está "el botón de
+        # cargar nube" debe ser más amigable. Ahora hay un estado vacío
+        # de verdad (icono + mensaje + botón grande) antes de cargar un
+        # proyecto, y los controles reales (que si tienen sentido una vez
+        # hay una nube) viven en una segunda página que se activa sola en
+        # cuanto set_tile_manager() recibe un tile manager real.
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_empty_state())
+        self._stack.addWidget(self._build_loaded_page())
+        root.addWidget(self._stack)
+
+    def _build_empty_state(self) -> QWidget:
+        w = QWidget(); w.setStyleSheet(f"background:{SURFACE_2};")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(24, 40, 24, 24)
+        lay.setSpacing(14)
+        lay.addStretch()
+
+        ic_bg = QFrame(); ic_bg.setObjectName("emptyIconBg")
+        ic_bg.setFixedSize(72, 72)
+        ic_bg.setStyleSheet(f"QFrame#emptyIconBg{{background:{ACCENT_SOFT};border-radius:36px;}}")
+        ic_l = QVBoxLayout(ic_bg); ic_l.setContentsMargins(0, 0, 0, 0)
+        ic = QLabel(); ic.setAlignment(Qt.AlignCenter)
+        ic.setPixmap(qpixmap("cloud-arrow-up", ACCENT_STRONG, 34))
+        ic.setStyleSheet("background:transparent;")
+        ic_l.addWidget(ic)
+        ic_row = QHBoxLayout(); ic_row.addStretch(); ic_row.addWidget(ic_bg); ic_row.addStretch()
+        lay.addLayout(ic_row)
+
+        title = QLabel("Ninguna nube cargada")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color:{TEXT};font-size:14px;font-weight:700;background:transparent;")
+        lay.addWidget(title)
+
+        desc = QLabel(
+            "Carga un archivo LAS, LAZ, E57 o GA3D-Bin para empezar. "
+            "También puedes arrastrar el archivo directamente sobre esta ventana.")
+        desc.setAlignment(Qt.AlignCenter)
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{TEXT_MUTE};font-size:10.5px;background:transparent;")
+        lay.addWidget(desc)
+
+        btn = QPushButton("  Cargar nube")
+        btn.setIcon(qicon("cloud-arrow-up", "#ffffff"))
+        btn.setFixedHeight(38)
+        btn.setStyleSheet(
+            f"QPushButton{{background:{ACCENT};color:#ffffff;border:none;"
+            f"border-radius:5px;font-size:11px;font-weight:700;padding:0 18px;}}"
+            f"QPushButton:hover{{background:{ACCENT_STRONG};}}")
+        btn.clicked.connect(self.load_cloud_requested)
+        btn_row = QHBoxLayout(); btn_row.addStretch(); btn_row.addWidget(btn); btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        lay.addStretch()
+        return w
+
+    def _build_loaded_page(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
@@ -415,6 +481,7 @@ class TilePanel(QWidget):
 
         # ── Transform del grid ────────────────────────────────────────────────
         self._build_transform_section(root)
+        return page
 
     # ── API pública ──────────────────────────────────────────────────────────
 
@@ -423,6 +490,10 @@ class TilePanel(QWidget):
         self._active = None
         self._grid.set_tile_manager(tm)
         self._update_stats()
+        # Estado vacío (página 0) mientras no haya tile manager real —
+        # ver docstring de _build_ui.
+        if hasattr(self, "_stack"):
+            self._stack.setCurrentIndex(1 if tm is not None else 0)
 
     def set_active_tile(self, tile) -> None:
         self._active = tile
