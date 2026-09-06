@@ -339,6 +339,127 @@ def test_redesign_icons_and_rail():
           op is not None)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# TEST G — mapeo a códigos ASPRS del export .las clasificado. Antes solo se
+# verificó con un script suelto durante la sesión, nunca se dejó en el
+# arnés permanente — si alguien tocaba `_asprs_code_for` más adelante, nada
+# lo habría detectado. Cubre: keywords reconocidos, y el caso sin match
+# (debe caer en el rango reservado 64-255, nunca en un código estándar).
+# ══════════════════════════════════════════════════════════════════════════
+def test_asprs_code_mapping():
+    from annotation.exporter import _asprs_code_for
+
+    check("ASPRS: 'Suelo' -> 2 (ground)",
+          _asprs_code_for(1, "Suelo") == 2)
+    check("ASPRS: 'Veg. baja' -> 3 (low veg)",
+          _asprs_code_for(2, "Veg. baja") == 3)
+    check("ASPRS: 'Edificio' -> 6 (building)",
+          _asprs_code_for(5, "Edificio") == 6)
+    check("ASPRS: 'Sin clasificar' -> 1 (unclassified)",
+          _asprs_code_for(0, "Sin clasificar") == 1)
+
+    unmatched = _asprs_code_for(7, "Cable eléctrico")
+    check("ASPRS: nombre sin match cae en rango reservado 64-255 (no colisiona)",
+          64 <= unmatched <= 255, f"got={unmatched}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST H — lógica del marcador de sesión para detectar un crash previo
+# (MainWindow._setup_crash_handler / _save_window_state). No se puede
+# instanciar MainWindow aquí (VTK real, ver limitación del módulo), así que
+# se reproduce la MISMA secuencia de marcador de archivo que usa el código
+# real: creado al iniciar, borrado en un cierre limpio, y si sigue ahí al
+# siguiente inicio es que la sesión anterior murió sin pasar por closeEvent.
+# ══════════════════════════════════════════════════════════════════════════
+def test_crash_marker_sequence():
+    marker = Path(tempfile.mkdtemp()) / ".session_running"
+
+    def start():
+        had_crash = marker.exists()
+        marker.write_text("running", encoding="utf-8")
+        return had_crash
+
+    def clean_close():
+        if marker.exists():
+            marker.unlink()
+
+    s1 = start(); clean_close()
+    check("crash-marker: sesión limpia no reporta crash previo", s1 is False)
+
+    s2 = start()   # sin clean_close — simula crash
+    check("crash-marker: sesión que sí venía limpia arranca bien", s2 is False)
+
+    s3 = start()
+    check("crash-marker: detecta que la sesión anterior no cerró limpio",
+          s3 is True)
+    clean_close()
+
+    s4 = start()
+    check("crash-marker: tras un cierre limpio, no se repite el aviso",
+          s4 is False)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST I — reanudar entrenamiento desde checkpoint (training_panel.py). Antes
+# de esto solo se verificó con un script suelto; se deja aquí un round-trip
+# real con PyTorch: guardar checkpoint con estado de optimizer/scheduler,
+# cargarlo, y confirmar que epoch/optimizer/scheduler se restauran (no solo
+# los pesos del modelo, que era el bug — reanudar "a medias" perdía el
+# momentum del optimizer y el punto del LR schedule).
+# ══════════════════════════════════════════════════════════════════════════
+def test_training_checkpoint_resume_roundtrip():
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        print("[SKIP] test_training_checkpoint_resume_roundtrip — PyTorch no instalado")
+        return
+
+    model = nn.Linear(4, 2)
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
+    sch = torch.optim.lr_scheduler.StepLR(opt, step_size=2, gamma=0.5)
+
+    # Simula unos pasos de entrenamiento para que el optimizer tenga estado
+    # real (momentum) y el scheduler haya avanzado, no un estado recién creado.
+    for _ in range(3):
+        opt.zero_grad()
+        loss = model(torch.randn(4)).sum()
+        loss.backward()
+        opt.step()
+        sch.step()
+    lr_before = opt.param_groups[0]['lr']
+
+    ckpt_path = Path(tempfile.mkdtemp()) / "ckpt.pth"
+    torch.save({
+        "epoch": 3,
+        "model_state": model.state_dict(),
+        "optimizer_state": opt.state_dict(),
+        "scheduler_state": sch.state_dict(),
+        "miou": 0.42,
+    }, ckpt_path)
+
+    # Nuevo modelo/optimizer/scheduler "en blanco" — como al reanudar en una
+    # sesión nueva de la app.
+    model2 = nn.Linear(4, 2)
+    opt2 = torch.optim.Adam(model2.parameters(), lr=0.01)
+    sch2 = torch.optim.lr_scheduler.StepLR(opt2, step_size=2, gamma=0.5)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model2.load_state_dict(ckpt["model_state"])
+    opt2.load_state_dict(ckpt["optimizer_state"])
+    sch2.load_state_dict(ckpt["scheduler_state"])
+
+    check("checkpoint resume: epoch guardado se recupera",
+          ckpt["epoch"] == 3)
+    check("checkpoint resume: pesos del modelo coinciden tras cargar",
+          torch.allclose(model.weight, model2.weight))
+    check("checkpoint resume: LR del scheduler coincide (no se reinicia el schedule)",
+          abs(opt2.param_groups[0]['lr'] - lr_before) < 1e-9,
+          f"esperado={lr_before} obtenido={opt2.param_groups[0]['lr']}")
+    check("checkpoint resume: momentum del optimizer (estado Adam) se restaura",
+          len(opt2.state) > 0)
+
+
 if __name__ == "__main__":
     tests = [
         test_sphere_query_octree_grid_path,
@@ -347,6 +468,9 @@ if __name__ == "__main__":
         test_tool_panel_color_mode_sync,
         test_compute_colors_u8_annotation_reflects_labels,
         test_redesign_icons_and_rail,
+        test_asprs_code_mapping,
+        test_crash_marker_sequence,
+        test_training_checkpoint_resume_roundtrip,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

@@ -1,0 +1,12 @@
+Nuitka-Options: Used command line options:
+Nuitka-Options:   --standalone --onefile --windows-disable-console --windows-product-name=GeoAnnotate3D --windows-product-version=1.0.0.0 --windows-file-version=1.0.0.0 --windows-company-name=GeoAnnotate3D --windows-icon-from-ico=ui\icon.ico --enable-plugin=pyqt5 --enable-plugin=numpy --enable-plugin=torch --include-package=torch --include-package=torch.nn --include-package=torch.optim --include-package=torch.utils --include-package=torch.utils.data --include-package=torch.cuda --include-package=torch.backends --include-package=torch.backends.cudnn --include-package=vtk --include-package=vtkmodules --include-package=laspy --include-package=pye57 --include-package=scipy --include-package=scipy.spatial --include-package=scipy.interpolate --include-package=scipy.ndimage --include-package=sklearn --include-package=sklearn.neighbors --include-package=matplotlib --include-package=matplotlib.cm --include-package=matplotlib.colors --include-package=h5py --include-package=psutil --include-package=colorsys --include-package=importlib --include-package=importlib.util --include-package=core --include-package=render --include-package=annotation --include-package=ui --include-data-files=core\_fastcore*.pyd=core\ --include-data-dir=core=core --noinclude-unittest-mode=nofollow --python-flag=no_site --python-flag=no_warnings --assume-yes-for-downloads --output-dir=dist --output-filename=GeoAnnotate3D --jobs=4 main.py
+Nuitka:WARNING: The old console option '--disable-console' should not be given anymore, use '--windows-console-mode=disable' instead. It also has the extra mode 'attach' to consider.
+Nuitka-Plugins:WARNING: numpy: This plugin has been deprecated, do not enable it anymore.
+Nuitka-Plugins:WARNING: pyqt5: For the obsolete PyQt5 the Nuitka support is incomplete. Threading, callbacks to compiled functions, etc. may not be working.
+Nuitka-Plugins:WARNING:     Complex topic! More information can be found at https://nuitka.net/info/pyqt5.html
+Nuitka-Plugins:WARNING: torch: This plugin has been deprecated, do not enable it anymore.
+Nuitka: Starting Python compilation with:
+Nuitka:   Version '4.0.8' on Python 3.12 (flavor 'Unknown') commercial grade 'not installed'.
+Nuitka-Plugins:WARNING: matplotlib: Import error (not installed?) during compile time command execution: b'ModuleNotFoundError("No module named \'packaging\'")'
+FATAL: matplotlib: Error, it seems 'matplotlib' is not installed or broken.
+Nuitka-Reports: Compilation crash report written to file 'nuitka-crash-report.xml'.
