@@ -460,6 +460,126 @@ def test_training_checkpoint_resume_roundtrip():
           len(opt2.state) > 0)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# TEST J — herramienta "eliminar puntos" (DELETED_LABEL, ver label_store.py).
+# Pedido del usuario: cualquier herramienta de selección debe poder ELIMINAR
+# puntos de ruido de la nube (no solo quitarles la clase). Implementado
+# reutilizando el mecanismo de labels con un valor centinela (255) — estos
+# tests cubren las dos partes centrales: (1) LabelStore excluye los puntos
+# eliminados de toda estadística de "etiquetado", y el undo los recupera
+# igual que cualquier anotación; (2) el render los oculta (alpha=0) en
+# CUALQUIER modo de color, no solo en modo "Anotación".
+# ══════════════════════════════════════════════════════════════════════════
+def test_delete_points_label_store():
+    from annotation.label_store import LabelStore, DELETED_LABEL
+
+    ls = LabelStore()
+    labels = np.zeros(100, np.uint8)
+    ls.attach(labels)
+
+    ls.annotate(np.arange(0, 30), class_id=1)     # 30 pts clase 1
+    check("delete: 30 pts clase 1 antes de eliminar nada",
+          ls.n_labeled == 30 and ls.per_class_counts().get(1) == 30)
+
+    ls.delete_points(np.arange(0, 10))            # elimina 10 de esos 30
+    check("delete: n_labeled baja (los eliminados no cuentan como etiquetados)",
+          ls.n_labeled == 20, f"n_labeled={ls.n_labeled}")
+    check("delete: n_deleted refleja los puntos eliminados",
+          ls.n_deleted == 10, f"n_deleted={ls.n_deleted}")
+    check("delete: per_class_counts NO cuenta DELETED_LABEL como una clase",
+          DELETED_LABEL not in ls.per_class_counts(),
+          f"counts={ls.per_class_counts()}")
+    check("delete: los índices eliminados sí tienen el valor centinela",
+          bool((labels[0:10] == DELETED_LABEL).all()))
+
+    # Ctrl+Z debe recuperar los puntos eliminados, igual que cualquier
+    # anotación — es la razón de reusar el mecanismo de labels en vez de
+    # inventar un sistema de borrado aparte.
+    ls.undo()
+    check("delete: Ctrl+Z (undo) recupera los puntos eliminados",
+          ls.n_deleted == 0 and ls.per_class_counts().get(1) == 30,
+          f"n_deleted={ls.n_deleted} counts={ls.per_class_counts()}")
+
+
+def test_delete_points_excluded_from_export():
+    """Los puntos eliminados no deben aparecer en el dataset exportado
+    (ni con only_labeled=True ni con only_labeled=False — no son "puntos
+    sin etiquetar", son puntos que ya no están en la nube)."""
+    from annotation.exporter import ExportWorker, ExportConfig
+    from annotation.label_store import DELETED_LABEL
+
+    class FakePC:
+        filename = "fake.las"
+        offset = np.zeros(3)
+        def __init__(self, xyz): self.xyz = xyz; self.intensity = None; self.rgb = None
+
+    n = 40
+    xyz = np.random.rand(n, 3).astype(np.float32) * 10
+    labels = np.zeros(n, np.uint8)
+    labels[0:15] = 1                  # 15 pts clase 1
+    labels[15:20] = DELETED_LABEL     # 5 pts eliminados (ruido limpiado)
+    # el resto (20:40) queda sin etiquetar (clase 0)
+
+    pc = FakePC(xyz)
+
+    for only_labeled in (True, False):
+        cfg = ExportConfig(only_labeled=only_labeled)
+        w = ExportWorker.__new__(ExportWorker)   # sin __init__ de QThread real
+        w._pc = pc; w._labels = labels.copy(); w._config = cfg; w._tm = None
+        tiles = w._collect_tile_data()
+        all_labels = np.concatenate([t["labels"] for t in tiles]) if tiles else np.array([], np.uint8)
+        check(f"export (only_labeled={only_labeled}): ningún punto eliminado en el dataset",
+              DELETED_LABEL not in all_labels, f"labels presentes={np.unique(all_labels)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST K — modo de color "Confianza" (post-inferencia). "Future update" que
+# se agregó en esta ronda: infer_cloud(..., return_confidence=True) ya
+# calculaba el softmax internamente y lo descartaba — exponerlo como color
+# (rojo=insegura, verde=segura) ayuda a saber dónde revisar primero. Cubre:
+# alta confianza → tono verde (más G que R); baja confianza → tono rojo (más
+# R que G); y que sin "confidence" en attrs no explota (cae a otro modo).
+# ══════════════════════════════════════════════════════════════════════════
+def test_confidence_color_mode():
+    from render.colors import compute_colors_u8
+
+    xyz = np.random.rand(10, 3).astype(np.float32)
+    confidence = np.array([0.95]*5 + [0.10]*5, dtype=np.float32)
+
+    out = compute_colors_u8(xyz, {"confidence": confidence}, "Confianza")
+    check("confianza alta (0.95) → verde domina sobre rojo",
+          bool((out[:5, 1].astype(int) > out[:5, 0].astype(int)).all()),
+          f"rgba[0]={out[0]}")
+    check("confianza baja (0.10) → rojo domina sobre verde",
+          bool((out[5:, 0].astype(int) > out[5:, 1].astype(int)).all()),
+          f"rgba[5]={out[5]}")
+
+    # Sin "confidence" en attrs, el modo "Confianza" no debe reventar —
+    # debe caer a algún fallback (mismo patrón que "Intensidad"/"RGB" ya
+    # usan cuando el atributo no está disponible).
+    out2 = compute_colors_u8(xyz, {}, "Confianza")
+    check("modo 'Confianza' sin datos no revienta (cae a fallback)",
+          out2.shape == (10, 4))
+
+
+def test_delete_points_hidden_in_render():
+    from render.colors import compute_colors_u8, build_annotation_lut_u8
+
+    n = 50
+    xyz = np.random.rand(n, 3).astype(np.float32)
+    labels = np.zeros(n, np.uint8)
+    labels[5:10] = 255   # DELETED_LABEL
+    lut = build_annotation_lut_u8([])
+
+    for mode in ("Anotación", "Elevación", "Color único"):
+        out = compute_colors_u8(xyz, {}, mode, annotation_labels=labels,
+                                annotation_lut_u8=lut)
+        check(f"delete: puntos eliminados invisibles (alpha=0) en modo '{mode}'",
+              bool((out[5:10, 3] == 0).all()), f"alphas={out[5:10,3]}")
+        check(f"delete: puntos normales conservan su alpha en modo '{mode}'",
+              bool((out[20:25, 3] > 0).all()))
+
+
 if __name__ == "__main__":
     tests = [
         test_sphere_query_octree_grid_path,
@@ -471,6 +591,10 @@ if __name__ == "__main__":
         test_asprs_code_mapping,
         test_crash_marker_sequence,
         test_training_checkpoint_resume_roundtrip,
+        test_delete_points_label_store,
+        test_delete_points_excluded_from_export,
+        test_delete_points_hidden_in_render,
+        test_confidence_color_mode,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

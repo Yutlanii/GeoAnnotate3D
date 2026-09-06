@@ -461,6 +461,7 @@ class ToolPanel(QWidget):
     radius_changed          = pyqtSignal(float)    # sphere radius
     # Señales de opciones globales
     erase_mode_changed      = pyqtSignal(bool)
+    delete_mode_changed     = pyqtSignal(bool)
     only_unlabeled_changed  = pyqtSignal(bool)
     # Señales de herramientas específicas
     flood_step_changed      = pyqtSignal(float)
@@ -572,7 +573,32 @@ class ToolPanel(QWidget):
             f"QPushButton:checked{{background:{WARN_SOFT};border-color:{WARN};"
             f"color:{WARN};font-weight:700;}}")
         self._erase_btn.toggled.connect(self.erase_mode_changed)
+        self._erase_btn.toggled.connect(
+            lambda v: self._delete_btn.setChecked(False) if v else None)
         opt_l.addWidget(self._erase_btn)
+
+        # Eliminar puntos — distinto de "Modo borrar": borrar solo quita la
+        # clase (el punto sigue en la nube, sin etiquetar); esto saca el
+        # punto de la nube por completo (para limpiar ruido). Se puede
+        # deshacer con Ctrl+Z igual que cualquier anotación — se avisa en
+        # el tooltip para que no dé miedo de más usarlo.
+        self._delete_btn = QPushButton("  Eliminar puntos   [Supr]")
+        self._delete_btn.setIcon(qicon("trash", WARN))
+        self._delete_btn.setCheckable(True)
+        self._delete_btn.setToolTip(
+            "Con esta opción activa, cualquier herramienta de selección\n"
+            "ELIMINA los puntos seleccionados de la nube (no solo su clase)\n"
+            "— útil para limpiar ruido. Se puede deshacer con Ctrl+Z.")
+        self._delete_btn.setStyleSheet(
+            f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};"
+            f"border-radius:3px;color:{TEXT_DIM};font-size:10.5px;font-weight:600;padding:7px;text-align:left;}}"
+            f"QPushButton:hover{{border-color:{WARN};color:{WARN};background:{WARN_SOFT};}}"
+            f"QPushButton:checked{{background:{WARN};border-color:{WARN};"
+            f"color:#ffffff;font-weight:700;}}")
+        self._delete_btn.toggled.connect(self.delete_mode_changed)
+        self._delete_btn.toggled.connect(
+            lambda v: self._erase_btn.setChecked(False) if v else None)
+        opt_l.addWidget(self._delete_btn)
 
         # Solo sin etiquetar
         unl_row = QWidget(); unl_row.setStyleSheet("background:transparent;")
@@ -625,7 +651,7 @@ class ToolPanel(QWidget):
         self._color_combo = QComboBox()
         self._color_combo.addItems([
             "Anotación", "Elevación", "RGB",
-            "Intensidad", "Clasificación", "Color único",
+            "Intensidad", "Clasificación", "Confianza", "Color único",
         ])
         self._color_combo.setStyleSheet(
             f"QComboBox{{background:{SURFACE};border:1px solid {BORDER};border-radius:3px;"
@@ -679,6 +705,9 @@ class ToolPanel(QWidget):
 
     def set_erase_mode(self, v: bool) -> None:
         self._erase_btn.setChecked(v)
+
+    def set_delete_mode(self, v: bool) -> None:
+        self._delete_btn.setChecked(v)
 
     def set_cloud(self, pc) -> None:
         pass

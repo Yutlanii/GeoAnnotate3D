@@ -16,6 +16,9 @@ Principios de diseño:
     los puntos visibles). Esto es esencial: en tile mode tienes 5-30M pts completos.
   - Modo "borrar" (erase_mode=True) en todas las herramientas de selección:
     revierte puntos a clase 0 (sin etiquetar).
+  - Modo "eliminar" (delete_mode=True) en todas las herramientas de selección:
+    ELIMINA los puntos de la nube (no solo su clase) — para limpiar ruido.
+    Manda sobre erase_mode. Ver DELETED_LABEL en label_store.py.
   - Filtro "solo sin etiquetar" (only_unlabeled): aplica solo a puntos vacíos.
   - PolygonTool y BoxSelectTool usan proyección matricial sobre TODOS los puntos,
     igual que el "Segment" de CloudCompare — el diferencial principal.
@@ -56,6 +59,10 @@ class BaseTool:
         self.label_store:     Optional["LabelStore"]       = None
         self.active_class_id: int = 1
         self.erase_mode:      bool = False    # True → borra (clase 0)
+        self.delete_mode:     bool = False    # True → ELIMINA el punto de la nube
+                                              # (no una clase — ver DELETED_LABEL
+                                              # en label_store.py). Manda sobre
+                                              # erase_mode si ambos están activos.
         self.only_unlabeled:  bool = False    # True → solo puntos sin etiquetar
 
     def activate(self, canvas: "AnnotationCanvas") -> None:
@@ -353,7 +360,11 @@ class BaseTool:
                 indices = indices[mask]
         if len(indices) == 0:
             return
-        cid = 0 if self.erase_mode else self.active_class_id
+        if self.delete_mode:
+            from annotation.label_store import DELETED_LABEL
+            cid = DELETED_LABEL
+        else:
+            cid = 0 if self.erase_mode else self.active_class_id
         self.label_store.annotate(indices, cid)
         if self.canvas:
             self.canvas.refresh_colors(indices, cid)

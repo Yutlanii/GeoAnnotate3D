@@ -313,6 +313,16 @@ class ClassManagerDialog(QDialog):
         if not name:
             self._new_name.setFocus()
             return
+        # labels es un array uint8 (0-255) y 255 está reservado como
+        # DELETED_LABEL (punto eliminado de la nube, ver label_store.py) —
+        # una clase real nunca debe poder llegar a ese id.
+        from annotation.label_store import DELETED_LABEL
+        if self._next_id >= DELETED_LABEL:
+            QMessageBox.warning(
+                self, "Límite de clases",
+                f"No se pueden crear más de {DELETED_LABEL - 1} clases "
+                "(límite del formato de etiquetas).")
+            return
         color = self._new_color.color
         sc = SemanticClass(self._next_id, name, color)
         self._next_id += 1

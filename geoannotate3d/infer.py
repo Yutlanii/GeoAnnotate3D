@@ -394,7 +394,7 @@ def build_features(xyz: np.ndarray, intensity: np.ndarray,
 
 def infer_cloud(model, cloud: dict, num_classes: int,
                 pts: int, overlap: float, batch_size: int,
-                device: str) -> np.ndarray:
+                device: str, return_confidence: bool = False):
     """
     Inferencia sobre la nube completa usando parches solapados.
 
@@ -402,6 +402,14 @@ def infer_cloud(model, cloud: dict, num_classes: int,
     - Dividir la nube en bloques espaciales de pts puntos
     - Cada punto puede caer en múltiples parches (overlap)
     - Predicción final: promedio de logits sobre todos los parches
+
+    return_confidence=True añade una segunda salida: la confianza del
+    modelo en su propia predicción por punto (softmax máximo de los
+    logits promediados, 0-1) — permite colorear la nube por "qué tan
+    seguro estaba el modelo", útil para saber dónde enfocar la
+    revisión manual después de inferir. Por defecto False para no
+    romper a quien ya llama infer_cloud() esperando solo el array de
+    predicciones (compatibilidad hacia atrás).
     """
     import torch
 
@@ -546,7 +554,18 @@ def infer_cloud(model, cloud: dict, num_classes: int,
     covered_pct = float((vote_cnt > 0).mean()) * 100
     print(f"[Inferencia] Cobertura: {covered_pct:.1f}%")
 
-    return predictions
+    if not return_confidence:
+        return predictions
+
+    # Softmax numéricamente estable sobre los logits ya promediados —
+    # el máximo por punto es "qué tan segura está la red de su propia
+    # predicción en ese punto" (no una probabilidad calibrada de verdad,
+    # pero sí una señal útil y barata de dónde revisar primero).
+    shifted    = avg_logits - avg_logits.max(axis=1, keepdims=True)
+    exp        = np.exp(shifted)
+    probs      = exp / np.maximum(exp.sum(axis=1, keepdims=True), 1e-9)
+    confidence = probs.max(axis=1).astype(np.float32)
+    return predictions, confidence
 
 
 # ── Guardar resultado ─────────────────────────────────────────────────────────

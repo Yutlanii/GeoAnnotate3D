@@ -25,6 +25,19 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 # Máximo de operaciones en el stack de undo
 MAX_UNDO = 50
 
+# Valor centinela para "punto eliminado permanentemente" (no una clase real).
+# Antes solo existía "borrar" = reclasificar a 0 (sin etiquetar) — no había
+# forma de quitar puntos de ruido de la nube en sí. En vez de redimensionar
+# xyz/atributos (complicado y arriesgado con nubes out-of-core sobre mmap:
+# octree, tile cache y export dependen todos de que el índice de un punto no
+# cambie), se reutiliza el mecanismo de labels ya existente: 255 nunca lo usa
+# una clase real (class_manager.py lo evita explícitamente, ver _next_id),
+# así que "eliminar" es solo annotate(indices, DELETED_LABEL). Esto da undo/
+# redo, autosave y stats gratis (misma maquinaria que cualquier anotación) —
+# el punto se excluye de las estadísticas de "etiquetado", del render (alpha
+# 0 en render/colors.py) y de todo export (annotation/exporter.py).
+DELETED_LABEL = 255
+
 
 # ---------------------------------------------------------------------------
 # Operación de anotación (unidad de undo)
@@ -182,9 +195,12 @@ class LabelStore(QObject):
 
     @property
     def n_labeled(self) -> int:
+        """Puntos con una clase real asignada — excluye 0 (sin etiquetar)
+        Y DELETED_LABEL (eliminado: no está "etiquetado", está fuera)."""
         if self._labels is None:
             return 0
-        return int(np.count_nonzero(self._labels))
+        return int(np.count_nonzero(
+            (self._labels != 0) & (self._labels != DELETED_LABEL)))
 
     @property
     def n_total(self) -> int:
@@ -192,17 +208,35 @@ class LabelStore(QObject):
             return 0
         return len(self._labels)
 
+    @property
+    def n_deleted(self) -> int:
+        """Puntos marcados para eliminación permanente (ver DELETED_LABEL)."""
+        if self._labels is None:
+            return 0
+        return int(np.count_nonzero(self._labels == DELETED_LABEL))
+
+    def delete_points(self, indices: np.ndarray) -> None:
+        """Marca `indices` como eliminados permanentemente de la nube.
+
+        No es una clase — es un estado especial: el punto deja de
+        renderizarse (alpha 0, ver render/colors.py) y se excluye de
+        todo export (ver annotation/exporter.py). Reutiliza annotate()
+        así que tiene undo/redo gratis, igual que cualquier anotación."""
+        self.annotate(indices, DELETED_LABEL)
+
     def per_class_counts(self) -> dict:
         if self._labels is None:
             return {}
         try:
             from core._fast import FC
             counts = FC.per_class_counts(self._labels)
-            # Remove class 0 (unlabeled)
+            # Remove class 0 (unlabeled) y DELETED_LABEL (no es una clase)
             counts.pop(0, None)
+            counts.pop(DELETED_LABEL, None)
             return counts
         except Exception:
             lbl = self._labels[self._labels > 0]
+            lbl = lbl[lbl != DELETED_LABEL]
             if len(lbl) == 0:
                 return {}
             unique, counts = np.unique(lbl, return_counts=True)

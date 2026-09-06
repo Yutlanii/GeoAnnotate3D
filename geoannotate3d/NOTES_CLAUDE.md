@@ -1319,3 +1319,109 @@ infer_panel.py, training_panel.py, export_dialog.py) solo mapeé firmas de
 clases/funciones (`grep ^class|^def`) + fragmentos — suficiente para entender la
 arquitectura pero **antes de tocar código en esos archivos, releer el archivo
 completo primero**, no fiarse solo de este resumen.
+
+## 35. Herramienta "eliminar puntos" + onboarding rediseñado + confianza (2026-09-06)
+
+**(a) Herramienta de eliminación de puntos** (pedido explícito: limpiar ruido
+de la nube, no solo declasificarlo). Implementada reutilizando el mecanismo
+de labels en vez de redimensionar arrays (arriesgado con mmap/octree/tile
+cache, todos dependen de que el índice de un punto no cambie):
+
+- `DELETED_LABEL = 255` (sentinela, `annotation/label_store.py`) — nunca una
+  clase real. `LabelStore.delete_points(idx)` es solo `annotate(idx,
+  DELETED_LABEL)`, así que undo/redo/autosave funcionan gratis.
+- `BaseTool.delete_mode` (nuevo, `annotation/tools.py`) — manda sobre
+  `erase_mode` en `_apply_selection`. Cualquier herramienta de selección
+  existente (pincel, disco, caja, esfera, polígono, region growing, corte Z)
+  puede eliminar puntos con este modo activo — exactamente lo pedido.
+- Render: `compute_colors_u8()` en `render/colors.py` enmascara alpha=0 para
+  puntos eliminados **en CUALQUIER modo de color** (no solo "Anotación") —
+  el chequeo vive en un wrapper alrededor de `_compute_colors_u8_impl`,
+  fuera de las ramas por modo, precisamente para que aplique siempre. Los
+  LUTs de anotación (`build_annotation_lut(_u8)`) también fuerzan
+  `lut[255]` transparente como defensa en profundidad.
+- Export: `annotation/exporter.py` excluye `DELETED_LABEL` de TODO export
+  (dataset por arquitectura y `.las` clasificado) sin importar `only_labeled`
+  — un punto eliminado no es "sin etiquetar", ya no está en la nube. También
+  se corrigió que `_write_global_metadata` contaba 255 como si fuera una
+  clase real de las estadísticas del dataset (bug real encontrado al
+  implementar esto, no solo hipotético).
+- `ui/class_manager.py`: tope explícito de `_next_id < 255` al crear clases
+  — sin esto, con suficientes clases creadas/borradas el sistema podría
+  eventualmente asignar el id 255 a una clase real y colisionar con el
+  sentinela.
+- UI: botón "Eliminar puntos [Supr]" en `ui/tool_panel.py`, mutuamente
+  excluyente con "Modo borrar [E]" (activar uno desactiva el otro). Estado
+  activo con fondo rojo sólido (más alarmante que el naranja suave de
+  "borrar" — a propósito, es una acción más consecuente). Atajo `Supr`
+  añadido en `main_window.py::keyPressEvent`, documentado en
+  `ui/shortcuts_dialog.py`.
+- Bugs reales encontrados de paso (no relacionados con esta feature, pero
+  hallados al auditar cómo main_window.py cuenta "puntos etiquetados"):
+  dos lugares (`_on_project_loaded`, `_activate_annotation_color_if_labeled`)
+  hacían `(labels > 0).sum()` sin excluir 255 — corregidos.
+- Verificado con 5 tests permanentes nuevos en `tests/verify_fixes.py`:
+  `test_delete_points_label_store` (n_labeled/n_deleted/per_class_counts/
+  undo), `test_delete_points_excluded_from_export` (ambos valores de
+  only_labeled), `test_delete_points_hidden_in_render` (alpha=0 en 3 modos
+  de color distintos).
+
+**(b) Rediseño de onboarding — `WelcomeDialog` (`ui/welcome_dialog.py`).**
+v1 apilaba las 6 tarjetas de paso en una lista vertical con scroll, cada
+una con un párrafo denso + tips en cursiva unidos con "•" — se leía como
+una hoja de especificaciones. v2: tour guiado de un paso a la vez (como
+Slack/Notion en su primer arranque) — riel izquierdo con badges circulares
+numerados y coloreados (mismo lenguaje visual que `class_panel.py`), a la
+derecha SOLO el paso activo en grande con 1-2 frases + UN tip destacado.
+Navegación por click en el riel o Anterior/Siguiente. Bug encontrado y
+corregido durante la verificación: a 520px de alto la tarjeta "El ciclo de
+mejora" al fondo del riel se superponía con el último ítem — subido el
+alto mínimo del diálogo (480→560) y reducida la altura de cada ítem del
+riel (56→46px) hasta que cupiera limpio a la altura por defecto real,
+confirmado con captura.
+
+**(c) Estado vacío de `TilePanel` (`ui/tile_panel.py`) — "la ventana donde
+está el botón de cargar nube".** Antes, incluso sin ningún proyecto
+cargado, el panel mostraba SIEMPRE los controles de "Tamaño de tile" +
+una grilla vacía con el texto plano "Sin nube cargada" — controles para
+algo que no existe, sin ninguna llamada a la acción. Ahora es un
+`QStackedWidget` interno con dos páginas: página 0 = estado vacío real
+(icono grande, mensaje amigable, botón "Cargar nube" prominente que
+emite la nueva señal `load_cloud_requested` → conectada a
+`window.new_project` en main_window.py); página 1 = los controles reales
+(sin cambios), que se activan solos en cuanto `set_tile_manager()` recibe
+un tile manager real. 100% seguro de tocar sin acceso a VTK en vivo —
+`TilePanel` es un `QWidget` plano, nada de esto toca `AnnotationCanvas`.
+
+**(d) "Future update" agregado: modo de color "Confianza" post-inferencia.**
+`infer_cloud()` en `infer.py` ya calculaba `avg_logits` (logits promediados
+entre parches solapados) justo antes del argmax final — con ese cálculo ya
+hecho, exponer la confianza del modelo (softmax máximo por punto) es casi
+gratis. Nuevo parámetro opcional `return_confidence=False` (compatibilidad
+hacia atrás total — los 2 call sites existentes que no lo pasan siguen
+recibiendo solo el array de predicciones). `InferWorker`/`InferPanel` en
+`ui/infer_panel.py` ahora piden `return_confidence=True` y propagan la
+confianza vía `inference_done(predictions, confidence)`; `main_window.py`
+la guarda en `pc.confidence` (campo nuevo en `core/pointcloud.py`, incluido
+en `get_attrs()`). Nuevo modo "Confianza" en el combo de color
+(`ui/tool_panel.py`) y en `compute_colors_u8()` (`render/colors.py`, LUT
+"RdYlGn" — rojo=insegura, verde=segura), para saber dónde revisar primero
+después de inferir. `BatchInferWorker` (inferencia por lote) NO pide
+confianza — no hay canvas vivo para visualizarla ahí, límite de alcance
+razonable. Verificado con `test_confidence_color_mode` (alta confianza →
+verde domina, baja confianza → rojo domina, sin datos no revienta).
+
+**Build**: en esta misma sesión se compiló por primera vez el `.exe` con
+Nuitka (`build_exe.bat`, sin el paso de Inno Setup) — 2.6GB (CUDA
+incluido), en `dist/GeoAnnotate3D.exe`. Dos dependencias de compilación
+faltantes encontradas y arregladas sobre la marcha: `packaging` y
+`Pillow` (ninguna estaba en requirements.txt como dependencia de build,
+solo se necesitan para que el plugin de Nuitka introspeccione matplotlib
+en tiempo de compilación, no en tiempo de ejecución). También se generó
+`ui/icon.ico` (antes no existía, bloqueaba el build) a partir del icono
+cloud-check ya usado en la app — placeholder hasta que haya un icono de
+marca definitivo.
+
+Todo lo anterior verificado con `ast.parse` en cada archivo tocado y
+`tests/verify_fixes.py` completo (ahora ~15 grupos de test) en verde antes
+de considerarlo terminado.
