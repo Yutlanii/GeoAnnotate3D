@@ -1262,6 +1262,29 @@ class AnnotationCanvas(QWidget):
     def set_budget_auto(self, v): self._budget_auto = v
     def toggle_grid(self, show): pass
 
+    # ── Eye-Dome Lighting ─────────────────────────────────────────────────────
+    # Sombreado por profundidad (sin necesitar normales) que hace mucho más
+    # legible el relieve de una nube de puntos sin color — el mismo efecto
+    # que CloudCompare/Potree activan por defecto. VTK 9.x trae esto nativo
+    # (vtkEDLShading, backend OpenGL2) — no hace falta un shader propio.
+    # render/edl.py queda como estaba (stub) porque el pase real vive aquí,
+    # directamente sobre el pipeline de render del canvas (SetPass en el
+    # vtkRenderer), que es donde VTK espera que se conecte.
+    def set_edl_enabled(self, enabled: bool) -> None:
+        try:
+            if enabled:
+                if getattr(self, '_edl_pass', None) is None:
+                    basic_passes = vtk.vtkRenderStepsPass()
+                    edl = vtk.vtkEDLShading()
+                    edl.SetDelegatePass(basic_passes)
+                    self._edl_pass = edl
+                self._ren.SetPass(self._edl_pass)
+            else:
+                self._ren.SetPass(None)
+            self._do_render()
+        except Exception as e:
+            print(f"[EDL] No se pudo {'activar' if enabled else 'desactivar'}: {e}")
+
     def clamp_camera_to_cloud(self) -> None:
         """
         Evita que la camara se aleje demasiado de la nube.

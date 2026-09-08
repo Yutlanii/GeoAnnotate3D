@@ -758,6 +758,7 @@ class MainWindow(QMainWindow):
         self._tool_panel.point_size_changed.connect(self._canvas.set_point_size)
         self._tool_panel.grid_toggled.connect(self._canvas.toggle_grid)
         self._tool_panel.show_unlabeled_toggled.connect(self._on_show_unlabeled)
+        self._tool_panel.edl_toggled.connect(self._canvas.set_edl_enabled)
         # v2.0: nuevas herramientas
         self._tool_panel.erase_mode_changed.connect(self._on_erase_mode_changed)
         self._tool_panel.delete_mode_changed.connect(self._on_delete_mode_changed)
@@ -778,6 +779,7 @@ class MainWindow(QMainWindow):
         # en la clasificación AGL; ver _on_agl_auto_classify.)
         self._geo_panel.agl_auto_classify_requested.connect(self._on_agl_auto_classify)
         self._geo_panel.csf_classify_requested.connect(self._on_csf_classify)
+        self._geo_panel.sor_detect_requested.connect(self._on_sor_detect)
         self._geo_panel.agl_select_requested.connect(self._on_agl_select)
         self._geo_panel.rules_apply_all_requested.connect(self._on_rules_apply_all)
 
@@ -2102,6 +2104,58 @@ class MainWindow(QMainWindow):
         except Exception as e:
             progress.close(); self._status.hide_loading()
             QMessageBox.critical(self, "CSF Error", str(e))
+
+    def _on_sor_detect(self, k: int, std_ratio: float) -> None:
+        """
+        Statistical Outlier Removal — detecta puntos de ruido (aislados de
+        sus vecinos) y ofrece eliminarlos con la herramienta de eliminar
+        puntos ya existente (LabelStore.delete_points, con undo/redo
+        gratis). No borra nada sin confirmación explícita del usuario.
+        """
+        if self._pc is None or self._project is None: return
+        from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+        from annotation.noise_filter import detect_outliers_sor
+        import numpy as np
+
+        progress = QProgressDialog("Analizando densidad de la nube...", None, 0, 0, self)
+        progress.setWindowTitle("Detectar ruido (SOR)")
+        progress.setMinimumDuration(0); progress.setValue(0)
+        progress.setCancelButton(None)
+        QApplication.processEvents()
+        try:
+            xyz = self._pc.xyz.astype(np.float64)
+            # Puntos ya eliminados no deben volver a proponerse
+            already_deleted = None
+            if self._project.labels is not None:
+                from annotation.label_store import DELETED_LABEL
+                already_deleted = self._project.labels == DELETED_LABEL
+            mask = detect_outliers_sor(xyz, k=k, std_ratio=std_ratio)
+            if already_deleted is not None:
+                mask &= ~already_deleted
+            progress.close()
+            idx = np.where(mask)[0].astype(np.int64)
+            if len(idx) == 0:
+                QMessageBox.information(self, "SOR",
+                    "No se detectaron puntos candidatos a ruido con estos parámetros.\n"
+                    "Prueba a bajar la sensibilidad.")
+                return
+            pct = 100.0 * len(idx) / max(len(xyz), 1)
+            reply = QMessageBox.question(
+                self, "Ruido detectado",
+                f"Se detectaron {len(idx):,} puntos candidatos a ruido "
+                f"({pct:.2f}% de la nube).\n\n"
+                "¿Eliminarlos de la nube? Esta acción se puede deshacer con Ctrl+Z.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                return
+            self._label_store.delete_points(idx)
+            self._canvas.force_color_rebuild()
+            self._on_stats_changed()
+            QMessageBox.information(self, "SOR completado",
+                f"{len(idx):,} puntos eliminados.")
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "SOR Error", str(e))
 
     def _set_top_view(self) -> None:
         try:

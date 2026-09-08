@@ -29,7 +29,7 @@ from __future__ import annotations
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QFrame, QScrollArea, QComboBox,
-    QSizePolicy, QDoubleSpinBox,
+    QSizePolicy, QDoubleSpinBox, QSpinBox,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QSize
 from PyQt5.QtGui import QPainter, QLinearGradient, QColor
@@ -77,6 +77,7 @@ class GeoPanel(QWidget):
     rules_apply_all_requested   = pyqtSignal()
     agl_auto_classify_requested = pyqtSignal()
     csf_classify_requested      = pyqtSignal()
+    sor_detect_requested        = pyqtSignal(int, float)   # (k, std_ratio)
 
     _DEFAULT_LAYERS = [
         ("suelo",    ["suelo","ground","terreno","tierra","floor"],      -0.5,  0.3),
@@ -231,6 +232,61 @@ class GeoPanel(QWidget):
         self._csf_btn.clicked.connect(self.csf_classify_requested)
         l3.addWidget(self._csf_btn)
         lay.addWidget(gb3)
+
+        # ── PASO 3: limpiar ruido (Statistical Outlier Removal) ───────────────
+        # Mismo algoritmo que CloudCompare/PCL — pensado para combinar con la
+        # herramienta de "eliminar puntos" ya existente: detecta candidatos a
+        # ruido del sensor (puntos anormalmente aislados) y ofrece borrarlos.
+        gb4, l4 = self._card("PASO 3 — Limpiar ruido (SOR)", "eraser")
+
+        l4.addWidget(self._desc(
+            "Statistical Outlier Removal: detecta puntos anormalmente "
+            "aislados de sus vecinos (ruido del sensor) y los ofrece "
+            "para eliminar — mismo algoritmo que CloudCompare."))
+
+        k_row = QHBoxLayout(); k_row.setSpacing(6)
+        k_lbl = QLabel("Vecinos (k):")
+        k_lbl.setStyleSheet(f"color:{TEXT_MUTE};font-size:10px;background:transparent;")
+        k_row.addWidget(k_lbl)
+        self._sor_k = QSpinBox()
+        self._sor_k.setRange(3, 50); self._sor_k.setValue(8)
+        self._sor_k.setStyleSheet(
+            f"QSpinBox{{background:{SURFACE_2};border:1px solid {BORDER};border-radius:3px;"
+            f"color:{TEXT_DIM};padding:3px 6px;font-size:10px;}}"
+            f"QSpinBox:hover{{border-color:{ACCENT};}}")
+        k_row.addWidget(self._sor_k, 1)
+        l4.addLayout(k_row)
+
+        ratio_row = QHBoxLayout(); ratio_row.setSpacing(6)
+        ratio_lbl = QLabel("Sensibilidad:")
+        ratio_lbl.setStyleSheet(f"color:{TEXT_MUTE};font-size:10px;background:transparent;")
+        ratio_row.addWidget(ratio_lbl)
+        self._sor_ratio = QDoubleSpinBox()
+        self._sor_ratio.setRange(0.5, 5.0); self._sor_ratio.setValue(2.0)
+        self._sor_ratio.setSingleStep(0.1); self._sor_ratio.setDecimals(1)
+        self._sor_ratio.setStyleSheet(
+            f"QDoubleSpinBox{{background:{SURFACE_2};border:1px solid {BORDER};border-radius:3px;"
+            f"color:{TEXT_DIM};padding:3px 6px;font-size:10px;}}"
+            f"QDoubleSpinBox:hover{{border-color:{ACCENT};}}")
+        ratio_row.addWidget(self._sor_ratio, 1)
+        l4.addLayout(ratio_row)
+
+        sor_hint = QLabel("Menor sensibilidad = detecta más ruido (más agresivo)")
+        sor_hint.setWordWrap(True)
+        sor_hint.setStyleSheet(f"color:{TEXT_MUTE};font-size:9.5px;background:transparent;")
+        l4.addWidget(sor_hint)
+
+        self._sor_btn = QPushButton("  Detectar ruido (SOR)")
+        self._sor_btn.setIcon(qicon("eraser", WARN))
+        self._sor_btn.setStyleSheet(
+            f"QPushButton{{background:{WARN_SOFT};border:1px solid {WARN_SOFT};"
+            f"border-radius:4px;color:{WARN};padding:8px;font-size:10.5px;font-weight:600;}}"
+            f"QPushButton:hover{{border-color:{WARN};}}"
+            f"QPushButton:disabled{{background:{SURFACE_2};color:{TEXT_MUTE};border-color:{SURFACE_2};}}")
+        self._sor_btn.clicked.connect(
+            lambda: self.sor_detect_requested.emit(self._sor_k.value(), self._sor_ratio.value()))
+        l4.addWidget(self._sor_btn)
+        lay.addWidget(gb4)
 
         lay.addStretch()
 

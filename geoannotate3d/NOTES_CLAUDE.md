@@ -1636,3 +1636,175 @@ hubiera significado o (a) una traducción a medias que deja la UI en
 una mezcla incoherente de idiomas, o (b) verificación insuficiente,
 reabriendo la clase de bugs de recorte ya resueltos. Se documenta aquí
 como el siguiente gran pendiente, para una sesión dedicada solo a eso.
+
+## 40. Eye-Dome Lighting + Statistical Outlier Removal (2026-09-07)
+
+**(a) Eye-Dome Lighting — implementado de verdad, no solo conectado.**
+`render/edl.py` resultó ser un stub vacío (`class EDLFilter: ... pass`
+en cada método, nunca importado — ver sección 38). VTK 9.6 (la versión
+instalada) trae soporte nativo: `vtkEDLShading` sobre el backend
+OpenGL2, sin necesitar un shader propio. Implementado directamente en
+`render/canvas.py::AnnotationCanvas.set_edl_enabled(enabled)`:
+`vtkRenderStepsPass` como delegate + `vtkEDLShading` envolviéndolo,
+`self._ren.SetPass(edl_pass)` para activar / `SetPass(None)` para
+desactivar. Verificado que la API funciona sin excepciones sobre un
+`vtkRenderer` aislado (no se pudo probar visualmente sin una GPU real
+en este entorno, pero la construcción del pase — `SetDelegatePass` +
+`SetPass` — es exactamente el patrón documentado de VTK y no depende
+de nada específico de este proyecto). Toggle nuevo "Eye-Dome Lighting"
+en `ui/tool_panel.py` (sección VISUALIZACIÓN, junto a "Ver sin
+etiquetar"/"Grilla de fondo" — mismo lugar donde ya viven los otros
+controles de visualización), con tooltip explicando qué hace. Off por
+defecto (cambia el aspecto visual establecido; el usuario decide
+activarlo). Señal `edl_toggled` → `main_window.py` →
+`canvas.set_edl_enabled`.
+
+**(b) Statistical Outlier Removal — mismo algoritmo que CloudCompare/PCL.**
+Nuevo módulo `annotation/noise_filter.py::detect_outliers_sor(xyz, k,
+std_ratio)`: para cada punto, distancia media a sus k vecinos más
+cercanos (cKDTree, ya usado en el resto de la app); un punto es
+candidato a ruido si esa distancia excede `media_global + std_ratio *
+desviación_global`. Verificado con un caso sintético (cluster denso de
+50K pts + 200 pts de ruido disperso): 0 falsos positivos en el
+cluster, 200/200 ruido detectado, en 0.3s. Ubicado en `ui/geo_panel.py`
+como "PASO 3 — Limpiar ruido (SOR)", tercera tarjeta junto a AGL/CSF
+(mismo patrón: parámetros k/sensibilidad + botón) — encaja ahí porque
+es, como AGL/CSF, un método automático de preprocesado antes del
+etiquetado manual. El flujo NO borra nada sin confirmar: detecta →
+muestra cuántos puntos y qué % de la nube → el usuario confirma →
+`LabelStore.delete_points()` (la herramienta de eliminar puntos ya
+existente de la sección 35a, con undo/redo gratis). Nuevo handler
+`main_window.py::_on_sor_detect`, excluye puntos ya eliminados de
+volver a proponerse.
+
+Verificado: `ast.parse` en los 5 archivos tocados/nuevos
+(`render/canvas.py`, `ui/tool_panel.py`, `ui/main_window.py`,
+`ui/geo_panel.py`, `annotation/noise_filter.py`), `tests/verify_fixes.py`
+completo en verde (19 grupos, 2 nuevos: `test_sor_outlier_detection`,
+además de los de la ronda anterior), captura de `GeoPanel` con la
+nueva tarjeta SOR sin recortes.
+
+## 41. Diseño concreto — LOD dinámico en modo tile (NO implementado)
+
+Pedido del usuario: en modo tile, la densidad renderizada hoy es
+SIEMPRE la máxima del tile sin importar la distancia de cámara —
+quiere que se reduzca al alejarse (como ya hace Overview) y suba al
+acercarse, con la condición de seguridad explícita: las herramientas
+de dibujado deben seguir clasificando la densidad COMPLETA aunque en
+pantalla se vea una versión reducida (LOD).
+
+**Por qué no se implementó esta ronda:** a diferencia de EDL/SOR
+(acotados, verificables con un test síncrono), esto toca el núcleo del
+pipeline de render (`render/canvas.py`) y tiene un requisito de
+integridad de datos que este entorno no puede verificar visualmente en
+vivo (no hay GPU/ventana real aquí, solo capturas offscreen de widgets
+Qt planos — el canvas VTK no se puede instanciar sin una sesión
+gráfica real). Meterle mano sin poder confirmar el resultado en
+pantalla es el tipo de cambio que no debía apresurarse al final de una
+sesión ya muy larga. En vez de una implementación a medias y sin
+verificar, se deja aquí el diseño completo y concreto, investigado a
+fondo esta misma ronda — listo para ejecutar directamente en una
+sesión dedicada (con el usuario probando en vivo a cada paso).
+
+### Lo que YA existe y se puede reutilizar (no hay que inventar de cero)
+
+- `core/octree.py::Octree` ya tiene todo lo necesario:
+  `iter_lod_progression(budget)` (generador de niveles LOD0→LODn hasta
+  un presupuesto de puntos) y `_select_lod_idx(budget)`. El método
+  `select_lod(eye3d, frustum_planes, W, H, budget, fov_deg)` también
+  existe pero resultó estar sin usar en ningún lado (dead code) — el
+  mecanismo real de Overview no hace frustum culling en absoluto
+  (`render/lod_worker.py` lo dice explícitamente en su docstring: "NO
+  FRUSTUM CULLING in LOD loading — frustum is for rendering, not data
+  loading"). Es decir: Overview no reduce densidad por "qué está en
+  pantalla", reduce densidad por PRESUPUESTO TOTAL de puntos, ajustado
+  dinámicamente según el FPS medido en tiempo real.
+- `render/canvas.py::_fps_tick()` / `_lod_tick()`: el sistema que hace
+  esto en Overview. Cada tick mide FPS real; si es bajo baja
+  `self._budget` (menos puntos), si es alto lo sube. Cuando el usuario
+  no está interactuando (`_render_state == "DONE"`), sube el budget
+  progresivamente cada 40 ticks hasta el nivel LOD más fino disponible.
+  Ambos métodos ya tienen un `if self._tile_mode: return` explícito al
+  principio — es decir, tile mode está deliberadamente excluido de
+  todo esto hoy.
+- `render/lod_worker.py::LODWorker` — QThread que hace el trabajo
+  pesado (gather + color) en segundo plano y emite `coarse_ready`/
+  `batch_ready`, para no bloquear la UI.
+- `render/canvas.py::_TileLoader` (la clase que carga un tile
+  actualmente) ya tiene un patrón de "vista previa decimada primero,
+  densidad completa después" (`coarse_ready`/`_on_tile_coarse_ready`
+  antes de `_on_tile_loaded`) — o sea, el patrón "cargar en 2 fases" ya
+  se usa en tile mode, solo que hoy termina en densidad fija en vez de
+  seguir ajustándose con la cámara.
+
+### El problema de fondo a resolver (por qué no es solo "quitar el
+`if tile_mode: return`")
+
+`annotation/tools.py` (BrushTool y el resto de herramientas) consultan
+`canvas._cur_xyz` / `canvas._cur_idx` directamente para sus queries
+espaciales (confirmado leyendo el código: comentario en la línea ~428
+dice literalmente "los puntos actualmente cargados en el canvas
+(_cur_xyz/_cur_idx)"). Hoy `_cur_xyz`/`_cur_idx` son a la vez (a) lo
+que se sube a la GPU para renderizar Y (b) lo que las herramientas
+usan para pintar/clasificar — son la MISMA variable. Si simplemente se
+reemplaza `_cur_xyz` por una versión LOD-reducida para renderizar más
+rápido, las herramientas de dibujado clasificarían solo esa versión
+reducida — exactamente el bug que el usuario pidió explícitamente
+evitar.
+
+### Diseño propuesto: desacoplar "qué se renderiza" de "qué se puede
+pintar", sin tocar ninguna herramienta de `annotation/tools.py`
+
+1. Al entrar a un tile (`enter_tile_mode`/`_on_tile_loaded`), además de
+   guardar `_cur_xyz`/`_cur_idx` (el tile COMPLETO, sin cambios — esto
+   sigue siendo lo que ven las herramientas, cero cambios en
+   `annotation/tools.py`), construir un `Octree` propio del tile
+   (`self._tile_octree = Octree(); self._tile_octree.build(xyz_tile)`)
+   — mucho más rápido de construir que el de la nube completa porque
+   un tile es un subconjunto pequeño. Puede hacerse en el mismo hilo
+   de `_TileLoader` que ya carga el tile, para no bloquear la UI.
+2. Nuevos campos separados: `self._render_xyz` / `self._render_col` —
+   la versión LOD-reducida que efectivamente se sube a la GPU
+   (`_gpu_upload_zero_copy`). Se calculan como
+   `_cur_xyz[render_local_idx]` / `color_buffer[render_local_idx]`,
+   donde `render_local_idx` sale de
+   `self._tile_octree.iter_lod_progression(budget)` (reutilizando el
+   generador que ya existe, sin escribir un algoritmo de LOD nuevo).
+3. Reactivar `_fps_tick()`/`_lod_tick()` para tile mode: quitar el
+   `if self._tile_mode: return` de ambos, y dentro de cada uno
+   ramificar: si `self._tile_mode`, usar `self._tile_octree` +
+   `self._render_xyz`/`_render_col` (subir SOLO eso a la GPU); si no,
+   comportamiento actual sin cambios (`pc.octree`, `_cur_xyz` completo
+   — Overview sigue exactamente igual, "eso no se toca" tal como pidió
+   el usuario).
+4. `refresh_colors`/`force_color_rebuild` (donde el pincel ya avisa que
+   cambiaron colores) deben, en tile mode, recalcular el color
+   COMPLETO en el buffer de color del tile completo (comportamiento
+   actual, sin cambios — esto ya es correcto y rápido, ver sección
+   36c/"vía rápida" de `refresh_colors`), y además re-cortar con
+   `render_local_idx` antes de subir a la GPU (una sola indexación
+   barata, no un recálculo).
+5. Frustum culling explícito (no solo el implícito de la GPU al
+   rasterizar): dado que Overview mismo no lo hace (ver arriba), no es
+   necesario para paridad de comportamiento — se puede dejar para una
+   iteración posterior si hiciera falta más rendimiento.
+
+### Por qué esto es seguro para la integridad de los datos
+
+Ninguna herramienta de `annotation/tools.py` cambia ni una línea —
+siguen leyendo `_cur_xyz`/`_cur_idx`, que siguen siendo el tile
+COMPLETO exactamente como hoy. Solo se le agrega al canvas un buffer
+de render PARALELO y más pequeño. Un test de integridad para esta
+feature (cuando se implemente) debería: cargar un tile sintético,
+forzar un budget de render bajo (pocos puntos "visibles"), pintar con
+BrushTool sobre una zona, y verificar que TODOS los puntos reales del
+tile dentro del radio del pincel quedan clasificados en label_store,
+no solo los que estaban en el subconjunto de render — esa es la
+propiedad que hay que probar antes de dar esto por terminado, más que
+cualquier verificación visual.
+
+**Siguiente paso sugerido:** implementar esto en una sesión donde el
+usuario pueda probar en vivo cada cambio (con GPU real), dado que el
+entorno de este agente no puede renderizar VTK con ventana real para
+confirmar visualmente transiciones de LOD/FPS — solo puede verificar
+la lógica de datos con tests síncronos como el descrito arriba.
