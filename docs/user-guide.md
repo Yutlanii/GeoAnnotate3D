@@ -20,6 +20,18 @@ The header bar (top) shows the app name, the loaded file and point count, its CR
 - **TRANSFORM** — drag to move the grid, or use the Offset X/Y and Rotación fields to align it precisely with the cloud's footprint (useful when the cloud isn't axis-aligned).
 - Click a tile to enter **tile mode** (loads just that tile at full density); `Escape` or the **← Vista global** button returns to Overview.
 - Filters below the grid (**Sin anotar / Parcial / Completo**) let you jump straight to tiles that still need work.
+- Hover any tile (even at small grid-cell sizes, where inline text doesn't fit) to see a tooltip with its coordinates, labeled percentage, and whether it's the currently active tile.
+
+### What is `.ga3d_bin`, and why does it matter?
+
+`.ga3d_bin` ("GA3D-Bin") is GeoAnnotate3D's own binary point-cloud format — not a competing standard, but a fast **cache** the app creates automatically next to a `.las`/`.laz`/`.e57` file once it crosses **200 million points**.
+
+The difference from LAS/LAZ/E57 is structural, not just "a different extension":
+
+- **LAS/LAZ/E57** are designed for interchange between many tools, so every read has to parse a structured record format (and, for `.laz`, decompress it first) before you get usable coordinates.
+- **GA3D-Bin** is a flat binary layout — a small 512-byte header followed by raw `float32` XYZ (and other attributes) with no compression and no quantization. That means it can be opened with **memory-mapping (mmap)** instead of reading the whole file into RAM: the OS pages data in from disk on demand, so you can work with a cloud far larger than your available memory, and reopening it is essentially instant because there's no decompression or parsing step to redo.
+
+You don't need to manage this yourself: the first time you open a huge `.las`/`.laz`/`.e57`, GeoAnnotate3D offers to convert it once; from then on, opening that *same source file* again detects the existing `.ga3d_bin` and asks whether to use it (much faster than reconverting or re-parsing the original). You can also open a `.ga3d_bin` file directly. It lives alongside the original file (same name, `.ga3d_bin` extension) and is safe to delete — GeoAnnotate3D will just offer to regenerate it from the source the next time you open that file.
 
 ---
 
@@ -51,7 +63,7 @@ Two independent, automatic methods to reduce manual labeling. Neither depends on
 | Pick | `I` | Sample the class of the point under the cursor (to check what's already labeled). |
 | Medir | `M` | Measure distances in the scene. |
 
-`E` toggles erase mode on the active tool. `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo. `Ctrl+clic` on the canvas is the common "commit" gesture for the click-based tools.
+`E` toggles **erase mode** on the active tool — clears the class back to unlabeled (0), it does not remove the point. `Supr` (Delete) toggles **delete mode** instead — mutually exclusive with erase mode — which removes the selected points from the cloud entirely (useful for cleaning up sensor noise or stray points); this works with *any* of the selection tools above, not just one dedicated tool. Deleted points are excluded from every export and are undoable like any other annotation (`Ctrl+Z`). `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo. `Ctrl+clic` on the canvas is the common "commit" gesture for the click-based tools.
 
 **Reference layers** (rail entry below Inferir, or accessible while labeling): overlay georeferenced orthomosaics (`.tif`) or vector layers (`.shp`, `.geojson`, `.gpkg`, `.kml`, `.dxf`) with real-world coordinates to guide labeling. Lower the point cloud's own opacity from this panel to see an underlying raster more clearly, and use **Vista cenital** to align the camera top-down.
 

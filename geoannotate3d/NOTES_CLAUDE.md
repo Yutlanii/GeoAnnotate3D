@@ -1425,3 +1425,214 @@ marca definitivo.
 Todo lo anterior verificado con `ast.parse` en cada archivo tocado y
 `tests/verify_fixes.py` completo (ahora ~15 grupos de test) en verde antes
 de considerarlo terminado.
+
+## 36. Ronda "lista de mañana" — parte 1: bugs de rendimiento reales (2026-09-07)
+
+El usuario pidió una lista grande de cambios "para mañana"; ya llegó
+"mañana". De esa lista, esta sesión cubrió lo siguiente (el resto sigue
+pendiente, ver más abajo qué falta):
+
+**(a) Diálogo de onboarding redundante eliminado.** Había DOS diálogos de
+bienvenida en secuencia al arrancar: `WelcomeDialog` (rediseñado en la
+sección 35b, tour guiado de 6 pasos) y, justo después, un segundo
+diálogo modal más viejo (`MainWindow._build_onboarding_dialog`,
+disparado por `_maybe_show_onboarding()` desde `main.py`) con el mismo
+contenido resumido (4 tarjetas de paso + botón "Abrir nube de
+puntos…") en estilo pre-rediseño (hex sueltos, `#0e7c86` etc.).
+Eliminado por completo: `_maybe_show_onboarding`,
+`_build_onboarding_dialog`, `_prefs_path` (solo lo usaba este diálogo —
+y further inspección mostró que ni siquiera funcionaba: escribía
+`hide_onboarding` en un JSON que NADA leía nunca, el checkbox "No volver
+a mostrar" estaba roto de origen) y `_build_onboarding` (un tercer
+método, un WIDGET en vez de diálogo, con el mismo contenido — definido
+pero NUNCA llamado desde ningún lado, dead code puro). `main.py`
+simplificado a un solo `WelcomeDialog.show_if_needed(window)`.
+
+**(b) Region Growing: freeze de ~1s (usuario probó con 8M pts, un solo
+clic) — causa real encontrada y arreglada, no solo mitigada.**
+`RegionGrowingTool._grow()` en `annotation/region_growing.py` construía
+su grilla espacial con un bucle Python puro sobre TODOS los puntos
+visibles (`for li in range(n): cell_map[...].append(li)`) sin importar
+`max_dist_m` — cada clic pagaba el costo completo del tile/nube. Perfil
+con un caso reproducible (8M pts, cluster conectado de 4000 cerca de la
+semilla, ver test nuevo) mostró que la construcción de grilla en sí solo
+tardaba ~0.1s tras acotar al bounding-box de `max_dist_m` — el
+verdadero costo (~4.4s adicionales) era el BFS recorriendo, por cada
+candidato a vecino, un test de similitud (z/rgb/intensidad) en Python
+puro CONTRA LA SEMILLA (no contra el vecino — o sea, no depende de
+quién pregunta) sin cachear el resultado, y sin marcar nunca
+`visited=True` a un candidato rechazado — cualquier punto de fondo dentro
+del radio de cualquier punto del cluster se re-evaluaba una y otra vez.
+Fix en 3 capas, cada una verificada por separado con timers:
+  1. Recortar a un bounding-box de `max_dist_m` alrededor de la semilla
+     ANTES de construir nada (Region Growing por definición nunca sale
+     de ahí).
+  2. Precalcular el test de similitud UNA VEZ, vectorizado con NumPy,
+     sobre toda la caja — no por-candidato en Python.
+  3. Restringir el conjunto de trabajo del BFS a SOLO los puntos que
+     pasan ese test (un punto no-similar nunca puede ser seleccionado
+     sin importar desde dónde se le consulte, así que ni necesita
+     existir en la grilla espacial del BFS).
+Resultado medido: 8M pts, cluster de 4000 → **4.5s → 0.49s** (mismo
+caso exacto, antes/después). Nuevo test permanente
+`test_region_growing_performance_and_correctness` (además del tiempo,
+verifica que la selección se queda dentro del cluster conectado real —
+la optimización no debía cambiar el resultado del algoritmo, solo su
+velocidad).
+
+**(c) Modo "Anotación" más lento que RGB para navegar/rotar la cámara —
+causa real: alpha mixto forzaba renderizado translúcido.** El LUT de
+anotación (`build_annotation_lut_u8` en `render/colors.py`) daba a los
+puntos SIN ETIQUETAR (clase 0) `alpha=115/255` (~0.45, semi-transparente)
+para verse "apagados" frente a las clases ya etiquetadas — pero un solo
+punto con alpha<255 obliga a VTK a renderizar TODO el actor con blending
+translúcido en vez de opaco, mucho más caro por frame en nubes densas.
+Como sin-etiquetar es casi siempre la MAYORÍA de la nube mientras se
+está anotando activamente (a diferencia de "eliminado", que es la
+minoría), el modo Anotación pagaba ese costo de forma casi constante —
+exactamente el síntoma reportado ("en RGB no se traba, en anotación sí").
+Encontrado un SEGUNDO lugar con el mismo bug: `_colors_annotation()`
+(ruta legacy float32) volvía a forzar alpha=0.45 para clase 0
+INDEPENDIENTEMENTE de lo que ya pusiera el LUT, deshaciendo cualquier
+fix hecho solo en el LUT. Corregidos ambos (`build_annotation_lut`,
+`build_annotation_lut_u8`, `_colors_annotation`, y los 2 fallbacks sin
+LUT en `_compute_colors_u8_impl`/`compute_colors`) a gris OPACO
+(alpha=255/1.0) para sin-etiquetar — mismo efecto visual de "apagado"
+por color en vez de por transparencia, sin pagar el costo de
+renderizado translúcido. Los puntos ELIMINADOS (DELETED_LABEL) siguen
+con alpha=0 sin cambios — son la minoría real de casos. Nuevo test
+`test_annotation_mode_unlabeled_points_are_opaque` (verifica opacidad
+para clase 0 Y clase real, más que no haya regresionado el alpha=0 de
+eliminados).
+
+Verificado: `ast.parse` en los 5 archivos tocados
+(`main.py`/`ui/main_window.py`/`annotation/region_growing.py`/
+`render/colors.py`/`tests/verify_fixes.py`), `tests/verify_fixes.py`
+completo (ahora ~17 grupos) en verde.
+
+**Pendiente de la misma lista del usuario, NO cubierto en esta ronda
+(anotado para retomar, no perderlo)**:
+  - Rediseño del panel de tiles para que los cuadros de la grilla sean
+    más intuitivos (el estado vacío ya se rediseñó en la sección 35c,
+    pero eso es distinto de la grilla de tiles en sí una vez hay nube
+    cargada — el usuario señaló que a veces "solo se ven cuadrados").
+  - Traducción completa a inglés + selector de idioma ES/EN en el menú
+    Ayuda (i18n) — el ítem más grande de la lista, requiere una
+    infraestructura de traducción nueva, no solo traducir strings.
+  - Manual/tutoriales in-app específicos por herramienta y por paso,
+    incluyendo qué es `.ga3d_bin` y por qué importa (formato binario
+    propio, más rápido que .las/.laz/.e57 para lectura/manipulación
+    dentro de GeoAnnotate3D) — y llevar ese mismo contenido al GitHub
+    (`docs/`).
+  - Proponer (e idealmente integrar alguna) herramienta/función que
+    usen otros softwares de nubes de puntos (CloudCompare, LabelCloud,
+    etc.) que tenga sentido aquí — la sección 35d (modo de color
+    "Confianza") ya fue una primera adición en este espíritu; falta la
+    propuesta más amplia + decidir qué más agregar.
+
+## 37. Ronda "lista de mañana" — parte 2: panel de tiles + manual + propuestas
+
+**(d) Panel de tiles más intuitivo.** El usuario señaló que a veces la
+grilla "solo se ven cuadrados" — a celdas pequeñas (<22px, umbral
+`show_txt` en `TileGridWidget.paintEvent`) el texto interno
+(coordenadas/%) se oculta por falta de espacio, y no había NINGÚN otro
+mecanismo para identificar un tile salvo el tamaño de celda. Dos fixes
+bajos en riesgo, altos en claridad:
+  1. Tooltip nativo en `mouseMoveEvent` (`ui/tile_panel.py`) con
+     coordenadas + % etiquetado + si es el tile activo — funciona a
+     CUALQUIER tamaño de celda, no depende del espacio para dibujar
+     texto.
+  2. La leyenda (`Sin anotar/Parcial/Completo`) solo explicaba el color
+     de RELLENO (progreso), no el borde grueso de acento que marca el
+     tile activo — añadida una cuarta entrada "Activo" a la leyenda.
+
+**(e) Manual de uso in-app** (`ui/manual_dialog.py`, "Ayuda → Manual de
+uso") — mismo patrón visual que `ShortcutsDialog`. Resume cada paso del
+flujo (Nube/Pre-clasificar/Etiquetar/Exportar/Entrenar/Inferir), la
+tabla de herramientas de etiquetado con sus teclas, y una explicación
+de `.ga3d_bin` (qué es, por qué existe, cuándo se genera, que es seguro
+borrarlo). Contenido derivado directamente del código (STEP_NAMES,
+tools.py, heavy_cloud.py), no inventado. En paralelo, `docs/user-guide.md`
+(GitHub) recibió la misma explicación de GA3D-Bin como sección nueva, y
+se agregó a la tabla de herramientas la fila de "Eliminar puntos"
+(Supr) que faltaba ahí desde que se implementó esa función (sección 35a).
+
+Verificado: `ast.parse` en los 2 archivos nuevos/tocados
+(`ui/manual_dialog.py`, `ui/main_window.py`), `tests/verify_fixes.py`
+en verde, captura de `ManualDialog` sin recortes.
+
+## 38. Propuesta de herramientas de otros softwares de nubes de puntos
+
+Pedido explícito: proponer qué herramientas/funciones de software
+similar (CloudCompare, labelCloud, Potree, Supervisely, LP360) tendría
+sentido traer a GeoAnnotate3D. Evaluado con criterio de encaje real
+(no "lo que sea que exista en otro lado"), priorizado por esfuerzo vs
+valor:
+
+**Alto valor / esfuerzo moderado (recomendado como próximo paso):**
+- **Eye-Dome Lighting (EDL)** — CloudCompare/Potree lo usan por
+  defecto: una sombra basada en profundidad que hace MUCHO más legible
+  la geometría de una nube sin color (uno de los mayores saltos de
+  calidad visual posibles). Verificado en esta ronda: `render/edl.py`
+  existe pero es un STUB vacío (`class EDLFilter: ... pass` en cada
+  método, nunca importado desde ningún otro archivo) — NO está
+  implementado, es solo un scaffold con el nombre reservado. Sigue
+  siendo la recomendación de mayor impacto visual, pero haría falta
+  implementarlo de cero (un render pass de VTK), no solo conectarlo.
+- **SOR / filtro de ruido estadístico (Statistical Outlier Removal)** —
+  CloudCompare lo trae como herramienta de un clic para limpiar ruido
+  disperso; con la herramienta de "eliminar puntos" ya implementada
+  (sección 35a) esto encajaría naturalmente como un "auto-seleccionar
+  candidatos a ruido" antes de que el usuario confirme el borrado —
+  combina bien con lo que ya existe.
+- **Medición de distancia nube-a-nube o nube-a-malla** — típico en
+  control de calidad de levantamientos LiDAR (comparar dos vuelos, o
+  validar contra un modelo). Relevante para el público objetivo
+  (geomática/topografía) mencionado en el propio README.
+
+**Alto valor / esfuerzo grande (roadmap, no próximo paso):**
+- **Pre-etiquetado asistido tipo "click-to-segment"** (labelCloud /
+  Segment-Anything-3D style) — el pedido explícito de "qué se puede
+  sacar de labelCloud" apunta aquí. LabelCloud en sí es más simple que
+  GeoAnnotate3D (solo cajas 3D para detección de objetos, sin AGL/CSF/
+  entrenamiento/inferencia integrados), así que no hay una función
+  puntual que "extraer" de ahí — su único diferencial real frente a lo
+  que ya existe aquí sería un modelo de segmentación pre-entrenado que
+  proponga la selección con un solo clic en vez de que el usuario
+  arrastre el pincel/polígono. Viable pero es un proyecto propio (traer
+  un modelo, ejecutarlo localmente, exponerlo como otra "herramienta"
+  más) — no una tarde de trabajo.
+- **Exportación COPC / visor web (estilo Potree)** — compartir una nube
+  como visor de navegador sin instalar nada, común para presentar
+  resultados a un cliente/equipo que no usa GeoAnnotate3D.
+
+**Ya agregado esta sesión, en este mismo espíritu (no proponer sin
+también dar ejemplo de qué tipo de cosa entra en esta categoría):** el
+modo de color "Confianza" post-inferencia (sección 35d) — inspirado en
+cómo herramientas de segmentación semántica (Supervisely, CVAT) resaltan
+predicciones inciertas para guiar la revisión manual.
+
+## 39. Pendiente real — i18n (inglés + selector de idioma)
+
+**No implementado en esta ronda — decisión deliberada, no olvido.**
+Es, con diferencia, el ítem más grande de la lista del usuario: traducir
+"todo el texto que tiene el software, en cualquier panel o ventana" no
+es agregar un selector y una tabla de strings — el código actual tiene
+el texto en español escrito DIRECTAMENTE inline en cada `QLabel`/
+`setText`/`setToolTip` de ~20 archivos de `ui/*.py` (cientos de
+ocurrencias), sin ninguna capa de indirección. Hacerlo bien requiere:
+  1. Una infraestructura de traducción real (registro de claves →
+     texto por idioma, con fallback), no solo un `if lang=="en"`
+     disperso por todos lados.
+  2. Retocar CADA sitio que hoy tiene un string literal para que pase
+     por esa capa — literalmente cientos de puntos de edición.
+  3. Volver a verificar cada panel visualmente tras traducir (inglés
+     suele ser más corto que español, pero no siempre — títulos y
+     etiquetas ya ajustados al pixel para español pueden recortarse o
+     verse raros en inglés, el mismo tipo de bug de recorte que se
+     pasó gran parte de esta sesión corrigiendo).
+Intentar esto "de pasada" en el tiempo que quedaba de esta sesión
+hubiera significado o (a) una traducción a medias que deja la UI en
+una mezcla incoherente de idiomas, o (b) verificación insuficiente,
+reabriendo la clase de bugs de recorte ya resueltos. Se documenta aquí
+como el siguiente gran pendiente, para una sesión dedicada solo a eso.

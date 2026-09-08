@@ -148,6 +148,21 @@ class TileGridWidget(QWidget):
         if t != self._hover:
             self._hover = t; self.update()
             self.tile_hover_changed.emit(t)
+            # A celdas pequeñas (< 22px) el texto interno (coords/%) se
+            # oculta por espacio — sin nada más, la grilla se ve como
+            # puros cuadrados sin significado (reportado por el usuario:
+            # "a veces solo se ven cuadrados y el usuario puede
+            # confundirse"). Un tooltip nativo con la misma info funciona
+            # a CUALQUIER tamaño de celda, sin depender del espacio
+            # disponible para dibujar texto.
+            if t is not None:
+                status = ("Completo" if t.labeled_pct >= 99.5 else
+                          "Parcial" if t.labeled_pct > 0 else "Sin anotar")
+                extra = "  ·  activo" if t is self._active else ""
+                self.setToolTip(f"Tile ({t.col}, {t.row})\n"
+                                f"{t.labeled_pct:.0f}% etiquetado — {status}{extra}")
+            else:
+                self.setToolTip("")
 
     def leaveEvent(self, ev):
         if self._hover is not None:
@@ -476,6 +491,17 @@ class TilePanel(QWidget):
             lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:10.5px;background:transparent;")
             leg.addWidget(dot)
             leg.addWidget(lbl)
+        # "Activo" — antes la leyenda solo explicaba el color de RELLENO
+        # (progreso), no el borde grueso de acento que marca el tile
+        # seleccionado — un usuario podía ver ese borde resaltado sin
+        # saber qué significaba.
+        dot_active = QLabel()
+        dot_active.setFixedSize(10, 10)
+        dot_active.setStyleSheet(
+            f"background:{SURFACE};border:2px solid {ACCENT_STRONG};border-radius:2px;")
+        lbl_active = QLabel("Activo")
+        lbl_active.setStyleSheet(f"color:{TEXT_DIM};font-size:10.5px;background:transparent;")
+        leg.addWidget(dot_active); leg.addWidget(lbl_active)
         leg.addStretch()
         root.addLayout(leg)
 
