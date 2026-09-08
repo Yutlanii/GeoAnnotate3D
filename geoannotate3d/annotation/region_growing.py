@@ -17,7 +17,7 @@ ALGORITMO:
   5. Aceptado → añadir a cola y selección. Rechazado → barrera.
 """
 from __future__ import annotations
-from collections import deque, defaultdict
+from collections import deque
 import numpy as np
 from annotation.tools import BaseTool
 
@@ -78,20 +78,86 @@ class RegionGrowingTool(BaseTool):
         seed_int = (float(pc.intensity[seed_gi])
                     if self.use_intensity and pc.intensity is not None else None)
 
-        # ── 2. Hash grid espacial para búsqueda rápida de vecinos ────────────
+        # ── 1b. Recortar al vecindario local ANTES de todo lo demás ──────────
+        # Antes se construía la grilla espacial sobre TODO el tile/nube
+        # visible (hasta 8M+ puntos) sin importar qué tan chico fuera
+        # max_dist_m — un clic siempre pagaba el costo completo del tile.
+        # Region Growing por definición nunca sale de max_dist_m de la
+        # semilla, así que basta indexar esa caja.
+        margin = self.max_dist_m
+        box = ((np.abs(xyz_local[:, 0] - seed_xyz[0]) <= margin) &
+               (np.abs(xyz_local[:, 1] - seed_xyz[1]) <= margin))
+        box_local_idx = np.nonzero(box)[0]
+        xyz_box = xyz_local[box_local_idx]
+        n_box = len(xyz_box)
+        seed_bi = int(np.searchsorted(box_local_idx, seed_li))
+        box_to_global = (local_to_global[box_local_idx]
+                          if local_to_global is not None else box_local_idx)
+
+        # ── 1c. Test de similitud vs semilla — VECTORIZADO, sobre la caja ────
+        # El test de similitud (z/rgb/intensidad) siempre compara contra la
+        # SEMILLA, nunca contra el vecino actual — es decir, NO depende de
+        # quién lo esté consultando durante el BFS. Antes se recalculaba en
+        # Python puro por cada candidato a vecino, una y otra vez, cada vez
+        # que un punto del cluster lo encontraba en su vecindario 3×3 (un
+        # fondo denso alrededor del cluster generaba así cientos de miles
+        # de comprobaciones redundantes) — perfilado por separado, esto era
+        # el verdadero costo (~4.4s de los ~4.5s totales con 8M pts / un
+        # cluster de 4000), no la construcción de la grilla (~0.1s). Ahora
+        # se calcula UNA vez, vectorizado sobre toda la caja.
+        similar_mask = np.ones(n_box, dtype=bool)
+        if self.use_z:
+            similar_mask &= np.abs(xyz_box[:, 2] - seed_xyz[2]) <= self.tol_z
+        if self.use_rgb and seed_rgb is not None and pc.rgb is not None:
+            box_rgb = pc.rgb[box_to_global].astype(np.float32)
+            similar_mask &= np.abs(box_rgb - seed_rgb).max(axis=1) <= self.tol_rgb
+        if self.use_intensity and seed_int is not None and pc.intensity is not None:
+            box_int = pc.intensity[box_to_global].astype(np.float32)
+            similar_mask &= np.abs(box_int - seed_int) <= self.tol_intensity
+        similar_mask[seed_bi] = True
+
+        # ── 1d. Restringir a solo los candidatos similares ────────────────────
+        # Un punto que no pasa similar_mask NUNCA puede terminar
+        # seleccionado (sea cual sea su vecino de consulta) — así que ni
+        # siquiera necesita existir en la grilla espacial del BFS. Esto
+        # reduce el conjunto de trabajo de "toda la caja" (cientos de miles
+        # de puntos de fondo incluidos) a solo los candidatos reales
+        # (típicamente el tamaño del cluster), antes de construir nada.
+        sim_idx  = np.nonzero(similar_mask)[0]
+        xyz_local = xyz_box[sim_idx]
+        n = len(sim_idx)
+        local_to_global = box_to_global[sim_idx]
+        seed_li = int(np.searchsorted(sim_idx, seed_bi))
+
+        # ── 2. Hash grid espacial — construcción vectorizada ──────────────────
+        # Antes: `for li in range(n): cell_map[(ci[li],ri[li])].append(li)`
+        # — un bucle Python puro por cada punto. Ahora: agrupamos por celda
+        # con argsort/unique (vectorizado en C dentro de NumPy) y los
+        # grupos se guardan ya como lista de Python (`.tolist()` una sola
+        # vez aquí, no en cada consulta dentro del BFS).
         step = max(0.05, self.step_dist_m)
-        mn   = xyz_local[:, :2].min(0)
-        ci   = ((xyz_local[:, 0] - mn[0]) / step).astype(np.int32)
-        ri   = ((xyz_local[:, 1] - mn[1]) / step).astype(np.int32)
-        cell_map: dict = defaultdict(list)
-        for li in range(n):
-            cell_map[(int(ci[li]), int(ri[li]))].append(li)
+        mn   = xyz_local[:, :2].min(0) if n else np.zeros(2, np.float32)
+        ci   = ((xyz_local[:, 0] - mn[0]) / step).astype(np.int64)
+        ri   = ((xyz_local[:, 1] - mn[1]) / step).astype(np.int64)
+        row_span  = int(ri.max()) + 2 if n else 1
+        cell_key  = ci * np.int64(row_span) + ri
+
+        order      = np.argsort(cell_key, kind='stable')
+        sorted_key = cell_key[order]
+        uniq_key, first_pos = np.unique(sorted_key, return_index=True)
+        groups   = np.split(order, first_pos[1:])
+        cell_map = {int(k): g.tolist() for k, g in zip(uniq_key, groups)}
 
         # ── 3. BFS conectado ──────────────────────────────────────────────────
+        # Ya solo quedan candidatos que pasaron similar_mask, así que aquí
+        # dentro basta comprobar distancia (propagación local + límite
+        # global) — nada de rgb/z/intensidad de nuevo.
         max_r2_global = self.max_dist_m ** 2
         step_r2       = (step * 1.6) ** 2   # vecinos dentro de 1.6× el paso
 
-        visited  = np.zeros(n, dtype=bool)
+        visited  = [False] * n   # lista Python, no array NumPy — indexar un
+                                  # escalar en un bucle Python puro es más
+                                  # rápido en una lista que en un ndarray.
         selected = []
         queue    = deque()
 
@@ -108,45 +174,22 @@ class RegionGrowingTool(BaseTool):
             if (ds**2).sum() > max_r2_global:
                 continue
 
-            # Buscar vecinos en las 9 celdas adyacentes
+            # Buscar vecinos en las 9 celdas adyacentes — clave codificada
+            # (col*row_span + row), no tupla, para calzar con cell_map.
             cc, cr = int(ci[curr_li]), int(ri[curr_li])
             for dc in (-1, 0, 1):
                 for dr in (-1, 0, 1):
-                    neighbors = cell_map.get((cc+dc, cr+dr))
-                    if not neighbors: continue
+                    neighbors = cell_map.get((cc+dc) * row_span + (cr+dr))
+                    if neighbors is None: continue
                     for nb_li in neighbors:
                         if visited[nb_li]: continue
 
-                        # Distancia al punto actual (propagación local)
                         dxy = xyz_local[nb_li, :2] - curr_xy
                         if (dxy**2).sum() > step_r2: continue
 
-                        # Test de similitud vs SEMILLA (no vs vecino actual)
-                        similar = True
-
-                        if self.use_z and similar:
-                            if abs(float(xyz_local[nb_li, 2]) -
-                                   float(seed_xyz[2])) > self.tol_z:
-                                similar = False
-
-                        if self.use_rgb and similar and seed_rgb is not None:
-                            if pc.rgb is not None:
-                                nb_gi = int(local_to_global[nb_li]) if local_to_global is not None else nb_li
-                                if np.abs(pc.rgb[nb_gi].astype(np.float32)
-                                          - seed_rgb).max() > self.tol_rgb:
-                                    similar = False
-
-                        if self.use_intensity and similar and seed_int is not None:
-                            if pc.intensity is not None:
-                                nb_gi = int(local_to_global[nb_li]) if local_to_global is not None else nb_li
-                                if abs(float(pc.intensity[nb_gi]) -
-                                       seed_int) > self.tol_intensity:
-                                    similar = False
-
-                        if similar:
-                            visited[nb_li] = True
-                            queue.append(nb_li)
-                            selected.append(nb_li)
+                        visited[nb_li] = True
+                        queue.append(nb_li)
+                        selected.append(nb_li)
 
         if not selected:
             print("[RegionGrowing] Sin puntos similares conectados — "

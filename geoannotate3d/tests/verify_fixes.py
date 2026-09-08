@@ -562,6 +562,43 @@ def test_confidence_color_mode():
           out2.shape == (10, 4))
 
 
+def test_annotation_mode_unlabeled_points_are_opaque():
+    """
+    Antes, los puntos SIN etiquetar (clase 0) en modo "Anotación" tenían
+    alpha=115/255 (~0.45, semi-transparentes) para verse "apagados". Un
+    solo punto con alpha<255 obliga a VTK a renderizar TODO el actor con
+    blending translúcido — mucho más lento por frame que el modo RGB
+    (siempre opaco) — y como sin-etiquetar es casi siempre la MAYORÍA de
+    la nube mientras se anota, esto hacía que el modo Anotación se
+    sintiera notablemente más lento/tembloroso que RGB, reportado por el
+    usuario. Ahora deben verse "apagados" con un gris opaco (alpha=255),
+    igual que cualquier otra clase — solo los puntos ELIMINADOS
+    (DELETED_LABEL=255) deben seguir teniendo alpha=0.
+    """
+    from render.colors import (compute_colors_u8, build_annotation_lut_u8,
+                                DELETED_LABEL)
+    from core.project import SemanticClass
+
+    n = 100
+    xyz = np.random.rand(n, 3).astype(np.float32)
+    labels = np.zeros(n, np.uint8)
+    labels[10:20] = 1        # etiquetados con clase 1
+    labels[50:55] = DELETED_LABEL
+
+    schema = [SemanticClass(1, "Suelo", "#8c6018")]
+    lut = build_annotation_lut_u8(schema)
+    out = compute_colors_u8(xyz, {}, "Anotación",
+                            annotation_labels=labels, annotation_lut_u8=lut)
+
+    check("sin-etiquetar (clase 0) es totalmente opaco (alpha=255)",
+          bool((out[labels == 0, 3] == 255).all()),
+          f"alphas={np.unique(out[labels==0,3])}")
+    check("etiquetados (clase 1) siguen totalmente opacos",
+          bool((out[10:20, 3] == 255).all()))
+    check("eliminados siguen invisibles (alpha=0) — no regresionó el fix anterior",
+          bool((out[50:55, 3] == 0).all()))
+
+
 def test_delete_points_hidden_in_render():
     from render.colors import compute_colors_u8, build_annotation_lut_u8
 
@@ -580,6 +617,81 @@ def test_delete_points_hidden_in_render():
               bool((out[20:25, 3] > 0).all()))
 
 
+def test_region_growing_performance_and_correctness():
+    """
+    Antes, `_grow()` construía la grilla espacial con un bucle Python
+    puro sobre CADA punto del tile/nube visible (`for li in range(n):
+    cell_map[...].append(li)`) — con nubes de unos pocos millones de
+    puntos eso congelaba el software ~1s en un solo clic, reportado por
+    el usuario con una nube de "solo" 8M puntos. Este test reproduce
+    esa escala (8M puntos) y verifica DOS cosas: que ahora termina en
+    una fracción de segundo (no solo que "no truena"), y que la
+    selección resultante sigue siendo un cluster conectado razonable
+    alrededor de la semilla (no toda la nube, no vacío) — la
+    vectorización no debe cambiar el resultado del algoritmo.
+    """
+    import time
+    from annotation.region_growing import RegionGrowingTool
+
+    rng = np.random.default_rng(0)
+    n = 8_000_000
+    # Nube dispersa en un área grande (para que la caja recortada de
+    # verdad reduzca el trabajo) + un cluster denso y conectado cerca
+    # del origen (donde cae la semilla) para verificar la selección.
+    xyz = (rng.random((n, 3), dtype=np.float32) - 0.5) * 200.0
+    cluster_n = 4000
+    cluster = rng.normal(0, 0.15, size=(cluster_n, 3)).astype(np.float32)
+    xyz[:cluster_n] = cluster   # los primeros cluster_n puntos son el cluster
+
+    rgb = np.zeros((n, 3), dtype=np.uint8)
+    rgb[:cluster_n] = [200, 80, 80]     # cluster: un color uniforme
+    rgb[cluster_n:] = [20, 20, 20]      # resto: otro color (no debe unirse)
+
+    class FakePC:
+        pass
+    pc = FakePC(); pc.xyz = xyz; pc.rgb = rgb; pc.intensity = None
+
+    class FakeCanvas:
+        pass
+    canvas = FakeCanvas()
+    canvas.pc = pc
+    canvas._tile_mode = False
+    canvas._cur_xyz = xyz
+    canvas._cur_idx = None
+    canvas.project = None
+
+    tool = RegionGrowingTool()
+    tool.canvas = canvas
+    tool.label_store = None   # _apply_selection corta ahí — solo medimos _grow()
+    tool.tol_rgb = 30.0
+
+    captured = {}
+    def fake_apply(indices):
+        captured["indices"] = np.asarray(indices)
+    tool._apply_selection = fake_apply
+
+    seed = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    t0 = time.perf_counter()
+    tool._grow(seed)
+    elapsed = time.perf_counter() - t0
+
+    check(f"region growing en {n/1e6:.0f}M pts termina en <1.0s (antes ~1s+ SOLO "
+          f"construyendo la grilla) — tardó {elapsed:.3f}s",
+          elapsed < 1.0, f"elapsed={elapsed:.3f}s")
+
+    sel = captured.get("indices")
+    check("region growing seleccionó algo (no vacío)",
+          sel is not None and len(sel) > 0)
+    if sel is not None and len(sel) > 0:
+        check("region growing se quedó dentro del cluster conectado "
+              "(no se coló al resto de la nube)",
+              bool(sel.max() < cluster_n * 2),  # margen generoso, pero NO toda la nube
+              f"max_idx={sel.max()} (cluster_n={cluster_n}, total n={n})")
+        check("region growing encontró una porción razonable del cluster "
+              "(no solo la semilla)",
+              len(sel) > 10, f"len(sel)={len(sel)}")
+
+
 if __name__ == "__main__":
     tests = [
         test_sphere_query_octree_grid_path,
@@ -595,6 +707,8 @@ if __name__ == "__main__":
         test_delete_points_excluded_from_export,
         test_delete_points_hidden_in_render,
         test_confidence_color_mode,
+        test_region_growing_performance_and_correctness,
+        test_annotation_mode_unlabeled_points_are_opaque,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")

@@ -83,12 +83,12 @@ def main():
     # Cerrar splash y mostrar onboarding cuando todo esté listo
     def _after_splash():
         splash.close()
-        # 1) Onboarding (6 pasos) — solo si no lo ha visto antes
+        # Onboarding (6 pasos) — solo si no lo ha visto antes.
+        # Antes había un SEGUNDO diálogo ("Abrir nube de puntos…") que
+        # salía justo después de este, redundante — mismo contenido
+        # (pasos 1-4, botón abrir nube) ya cubierto aquí. Quitado.
         from ui.welcome_dialog import WelcomeDialog
         WelcomeDialog.show_if_needed(window)
-        # 2) Diálogo de cargar nube — siempre, justo después del onboarding
-        if hasattr(window, '_maybe_show_onboarding'):
-            window._maybe_show_onboarding()
 
     QTimer.singleShot(900, _after_splash)
 

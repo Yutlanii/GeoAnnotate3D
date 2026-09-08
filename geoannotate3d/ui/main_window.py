@@ -160,6 +160,7 @@ class _HeaderBar(QWidget):
         help_menu = QMenu(self._help_btn)
         help_menu.setStyleSheet(proj_menu.styleSheet())
         help_menu.addAction(_act("Atajos de teclado",      "F1", window.show_shortcuts))
+        help_menu.addAction(_act("Manual de uso",           None, window.show_manual))
         help_menu.addAction(_act("Bienvenida / Tutorial",   None, window.show_welcome_dialog))
         help_menu.addSeparator()
         help_menu.addAction(_act("Abrir carpeta de registros (logs)", None, window.open_logs_folder))
@@ -804,6 +805,11 @@ class MainWindow(QMainWindow):
     def show_shortcuts(self) -> None:
         from ui.shortcuts_dialog import ShortcutsDialog
         dlg = ShortcutsDialog(self)
+        dlg.exec_()
+
+    def show_manual(self) -> None:
+        from ui.manual_dialog import ManualDialog
+        dlg = ManualDialog(self)
         dlg.exec_()
 
     def show_welcome_dialog(self) -> None:
@@ -1896,215 +1902,6 @@ class MainWindow(QMainWindow):
             self._canvas.set_cloud_opacity(opacity)
         except Exception as e:
             print(f"[cloud opacity] {e}")
-
-    def _prefs_path(self) -> "Path":
-        import sys
-        return Path(sys.argv[0]).resolve().parent / ".geoannotate_prefs.json"
-
-    def _maybe_show_onboarding(self) -> None:
-        """Muestra el diálogo de cargar nube. Se llama siempre al inicio."""
-        # Solo mostrar si no hay proyecto cargado ya
-        if self._pc is not None:
-            return
-        dlg = self._build_onboarding_dialog()
-        dlg.exec_()
-
-    def _build_onboarding_dialog(self):
-        """Diálogo flotante de bienvenida, centrado, con opción 'no mostrar'."""
-        import json
-        from PyQt5.QtWidgets import QDialog, QCheckBox, QDialogButtonBox, QScrollArea as _SA
-        from PyQt5.QtCore import Qt
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Bienvenido a GeoAnnotate3D")
-        dlg.setFixedWidth(420)
-        dlg.setStyleSheet("QDialog{background:#e8e9eb;}")
-
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(20, 20, 20, 16); lay.setSpacing(10)
-
-        # Header
-        logo = QLabel("GeoAnnotate3D")
-        logo.setStyleSheet("color:#0e7c86;font-size:16px;font-weight:600;"
-                           "letter-spacing:1px;")
-        logo.setAlignment(Qt.AlignCenter)
-        sub = QLabel("Etiquetado LiDAR para redes neuronales")
-        sub.setStyleSheet("color:#55585c;font-size:10.5px;padding-bottom:8px;")
-        sub.setAlignment(Qt.AlignCenter)
-        lay.addWidget(logo); lay.addWidget(sub)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("background:#f4f5f6;max-height:1px;")
-        lay.addWidget(sep)
-
-        # Open button
-        btn_open = QPushButton("  Abrir nube de puntos…")
-        btn_open.setStyleSheet(
-            "QPushButton{background:#0e7c86;color:#55585c;border:none;"
-            "border-radius:4px;padding:10px;font-size:11px;font-weight:600;}"
-            "QPushButton:hover{background:#0a5f67;}")
-        def open_and_close():
-            dlg.accept(); self.new_project()
-        btn_open.clicked.connect(open_and_close)
-        lay.addWidget(btn_open)
-
-        hint = QLabel("o arrastra un archivo .las .laz .e57 a la ventana")
-        hint.setStyleSheet("color:#55585c;font-size:10.5px;")
-        hint.setAlignment(Qt.AlignCenter)
-        lay.addWidget(hint)
-
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("background:#f4f5f6;max-height:1px;margin:4px 0;")
-        lay.addWidget(sep2)
-
-        # Steps
-        def step_card(num, title, body, kbd=""):
-            card = QWidget()
-            card.setStyleSheet(
-                "background:#e8e9eb;border:1px solid #f4f5f6;"
-                "border-radius:4px;margin:1px 0;")
-            cl = QHBoxLayout(card)
-            cl.setContentsMargins(10,7,10,7); cl.setSpacing(8)
-            n = QLabel(num); n.setFixedSize(18,18); n.setAlignment(Qt.AlignCenter)
-            n.setStyleSheet("background:#0e7c86;color:#55585c;border-radius:3px;"
-                            "font-size:10.5px;font-weight:bold;")
-            tl = QVBoxLayout(); tl.setSpacing(0)
-            t = QLabel(title)
-            t.setStyleSheet("color:#55585c;font-size:10.5px;font-weight:600;")
-            d = QLabel(body); d.setWordWrap(True)
-            d.setStyleSheet("color:#55585c;font-size:10.5px;")
-            tl.addWidget(t); tl.addWidget(d)
-            cl.addWidget(n); cl.addLayout(tl,1)
-            if kbd:
-                k = QLabel(kbd)
-                k.setStyleSheet("background:#e8e9eb;border:1px solid #eceded;"
-                    "border-radius:3px;color:#55585c;font-size:10.5px;padding:2px 5px;")
-                cl.addWidget(k)
-            return card
-
-        lay.addWidget(step_card("1","Cargar nube",
-            "Abre un .las .laz .e57 y configura el grid de tiles.",""))
-        lay.addWidget(step_card("2","Pre-clasificar",
-            "AGL clasifica por altura · Region Growing expande desde un punto.",""))
-        lay.addWidget(step_card("3","Etiquetar",
-            "Pincel, polígono, caja. Teclas 1-9 cambian la clase activa.","1–9"))
-        lay.addWidget(step_card("4","Exportar",
-            "Genera el dataset para RandLA-Net, PointNet++ o KPConv.",""))
-
-        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine)
-        sep3.setStyleSheet("background:#f4f5f6;max-height:1px;margin:4px 0;")
-        lay.addWidget(sep3)
-
-        # Footer: no mostrar + cerrar
-        footer = QHBoxLayout()
-        chk = QCheckBox("No volver a mostrar")
-        chk.setStyleSheet("QCheckBox{color:#55585c;font-size:10.5px;}"
-                          "QCheckBox::indicator{width:13px;height:13px;}")
-        close_btn = QPushButton("Empezar")
-        close_btn.setStyleSheet(
-            "QPushButton{background:#f4f5f6;border:1px solid #eceded;"
-            "border-radius:4px;color:#55585c;padding:6px 16px;font-size:10.5px;}"
-            "QPushButton:hover{border-color:#0e7c86;color:#0e7c86;}")
-
-        def on_close():
-            if chk.isChecked():
-                try:
-                    pp = self._prefs_path()
-                    prefs = json.loads(pp.read_text()) if pp.exists() else {}
-                    prefs["hide_onboarding"] = True
-                    pp.write_text(json.dumps(prefs, indent=2))
-                except Exception: pass
-            dlg.accept()
-
-        close_btn.clicked.connect(on_close)
-        footer.addWidget(chk); footer.addStretch(); footer.addWidget(close_btn)
-        lay.addLayout(footer)
-        return dlg
-
-    def _build_onboarding(self):
-        """Widget de bienvenida cuando no hay nube cargada."""
-        from PyQt5.QtWidgets import QScrollArea as _SA
-        w = QWidget(); w.setStyleSheet("background:#e8e9eb;")
-        scroll = _SA(); scroll.setWidgetResizable(True)
-        scroll.setFrameShape(0)  # QFrame.NoFrame = 0
-        scroll.setStyleSheet("background:transparent;border:none;")
-        content = QWidget(); content.setStyleSheet("background:transparent;")
-        lay = QVBoxLayout(content)
-        lay.setContentsMargins(14, 18, 14, 14); lay.setSpacing(0)
-
-        def _lbl(txt, sty):
-            l = QLabel(txt); l.setWordWrap(True); l.setStyleSheet(sty); return l
-
-        lay.addWidget(_lbl("GeoAnnotate3D",
-            "color:#0e7c86;font-size:15px;font-weight:600;letter-spacing:1px;"
-            "padding-bottom:2px;qproperty-alignment:AlignCenter;"))
-        lay.addWidget(_lbl("Etiquetado LiDAR para redes neuronales",
-            "color:#55585c;font-size:10.5px;padding-bottom:18px;"
-            "qproperty-alignment:AlignCenter;"))
-
-        # Open button
-        btn = QPushButton("Abrir nube de puntos…")
-        btn.setStyleSheet(
-            "QPushButton{background:#0e7c86;color:#55585c;border:none;"
-            "border-radius:4px;padding:9px;font-size:10.5px;font-weight:600;}"
-            "QPushButton:hover{background:#0a5f67;}")
-        btn.clicked.connect(self.new_project)
-        lay.addWidget(btn); lay.addSpacing(5)
-
-        drag_hint = _lbl("o arrastra un archivo .las .laz .e57 a la ventana",
-            "color:#55585c;font-size:10.5px;qproperty-alignment:AlignCenter;"
-            "padding-bottom:18px;")
-        lay.addWidget(drag_hint)
-
-        # Steps
-        def step_card(num, title, body, kbd=""):
-            card = QWidget()
-            card.setStyleSheet(
-                "background:#e8e9eb;border:1px solid #f4f5f6;border-radius:3px;"
-                "margin-bottom:6px;")
-            cl = QHBoxLayout(card)
-            cl.setContentsMargins(10, 8, 10, 8); cl.setSpacing(8)
-            n = QLabel(num); n.setFixedSize(20,20); n.setAlignment(Qt.AlignCenter)
-            n.setStyleSheet(
-                "background:#0e7c86;color:#55585c;border-radius:10px;"
-                "font-size:10.5px;font-weight:bold;")
-            tl = QVBoxLayout(); tl.setSpacing(1)
-            t = QLabel(title)
-            t.setStyleSheet("color:#55585c;font-size:10.5px;font-weight:600;")
-            d = QLabel(body); d.setWordWrap(True)
-            d.setStyleSheet("color:#55585c;font-size:10.5px;")
-            tl.addWidget(t); tl.addWidget(d)
-            cl.addWidget(n); cl.addLayout(tl, 1)
-            if kbd:
-                k = QLabel(kbd)
-                k.setStyleSheet("background:#e8e9eb;border:1px solid #eceded;"
-                    "border-radius:3px;color:#55585c;font-size:10.5px;padding:2px 5px;")
-                cl.addWidget(k)
-            return card
-
-        lay.addWidget(step_card("1","Cargar nube",
-            "Abre un archivo LiDAR en cualquier formato soportado.","Ctrl+O"))
-        lay.addWidget(step_card("2","Pre-clasificar",
-            "AGL clasifica por altura · Region Growing expande desde un punto.",""))
-        lay.addWidget(step_card("3","Etiquetar",
-            "Pincel, polígono, caja y borrador. Teclas 1-9 cambian la clase.","1–9"))
-        lay.addWidget(step_card("4","Exportar dataset",
-            "Genera el dataset para RandLA-Net, PointNet++ o KPConv.",""))
-
-        lay.addSpacing(14)
-        lay.addWidget(_lbl("Formatos soportados",
-            "color:#55585c;font-size:10.5px;font-weight:600;"
-            "qproperty-alignment:AlignCenter;"))
-        lay.addWidget(_lbl(".las  ·  .laz  ·  .e57  ·  .ga3d_bin",
-            "color:#55585c;font-size:10.5px;qproperty-alignment:AlignCenter;"
-            "padding-bottom:4px;"))
-        lay.addWidget(_lbl("Ctrl+Z deshacer  ·  Ctrl+Y rehacer  ·  Ctrl+S guardar",
-            "color:#55585c;font-size:10.5px;qproperty-alignment:AlignCenter;"))
-
-        lay.addStretch()
-        scroll.setWidget(content)
-        ol = QVBoxLayout(w); ol.setContentsMargins(0,0,0,0); ol.addWidget(scroll)
-        return w
 
     def _set_workflow_step(self, step: int) -> None:
         """Actualiza el riel de navegación y la franja de breadcrumb."""

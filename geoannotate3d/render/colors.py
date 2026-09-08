@@ -177,7 +177,7 @@ def _compute_colors_u8_impl(xyz, attrs, mode, cmap="viridis",
         if annotation_labels is not None and annotation_lut_u8 is not None:
             return annotation_lut_u8[annotation_labels]  # DIRECTO: 275ms
         out = np.empty((n,4), np.uint8)
-        out[:,:3] = 235; out[:,3] = 140  # ~0.92, ~0.55
+        out[:,:3] = 216; out[:,3] = 255  # gris opaco — ver build_annotation_lut_u8
         return out
 
     # ── RGB real ──────────────────────────────────────────────────────────────
@@ -285,7 +285,7 @@ def compute_colors(xyz, attrs, mode, cmap="viridis",
         if annotation_labels is not None and annotation_lut is not None:
             return _colors_annotation(annotation_labels, annotation_lut)
         out = np.empty((n,4), np.float32)
-        out[:,:3] = 0.92; out[:,3] = 0.55
+        out[:,:3] = 0.85; out[:,3] = 1.0
         return out
 
     if mode == "RGB" and "rgb" in attrs:
@@ -350,10 +350,16 @@ def _colors_annotation(labels, lut):
     else:
         clipped = np.clip(labels.astype(np.int32), 0, 255)
         rgba = lut[clipped].astype(np.float32)
+    # Antes forzaba alpha=0.45 (translúcido) para sin-etiquetar aquí de
+    # nuevo, deshaciendo el alpha=1.0 ya correcto que pone la LUT (ver
+    # build_annotation_lut) — mismo bug de fondo que causaba el freeze de
+    # rendering en modo Anotación (VTK renderiza TODO el actor translúcido
+    # en cuanto CUALQUIER punto tiene alpha<1.0, y sin-etiquetar suele ser
+    # la mayoría de la nube). Gris opaco, sin tocar alpha.
     mask0 = labels == 0
     if mask0.any():
-        rgba[mask0, 0] = 0.92; rgba[mask0, 1] = 0.92
-        rgba[mask0, 2] = 0.92; rgba[mask0, 3] = 0.45
+        rgba[mask0, 0] = 0.85; rgba[mask0, 1] = 0.85
+        rgba[mask0, 2] = 0.85; rgba[mask0, 3] = 1.0
     return rgba
 
 
@@ -364,15 +370,29 @@ def _apply_lut(vals, name):
 
 
 def build_annotation_lut(schema_list):
-    """LUT (256,4) float32 desde el schema — para ruta legacy."""
-    lut = np.full((256,4), [0.92,0.92,0.92,0.45], dtype=np.float32)
+    """LUT (256,4) float32 desde el schema — para ruta legacy.
+
+    Puntos sin etiquetar (clase 0): antes alpha=0.45 (semi-transparente)
+    para verse "apagados" frente a las clases ya etiquetadas. Un punto
+    con alpha<1.0 obliga a VTK a renderizar TODO el actor con blending
+    translúcido en vez de opaco — mucho más lento por frame en nubes
+    densas — y como los puntos sin etiquetar son casi siempre la
+    mayoría de la nube mientras se está anotando, esto hacía lento
+    justamente el modo "Anotación" frente a RGB (siempre alpha=1.0,
+    siempre opaco). Ahora se ven "apagados" con un gris opaco
+    (alpha=1.0) en vez de con transparencia — mismo efecto visual de
+    "no etiquetado todavía", sin pagar el costo de renderizado
+    translúcido. Los puntos ELIMINADOS (DELETED_LABEL) siguen usando
+    alpha=0 — son la minoría real de casos, no la mayoría constante.
+    """
+    lut = np.full((256,4), [0.85,0.85,0.85,1.0], dtype=np.float32)
     for sc in schema_list:
         idx = int(sc.id)
         if 0 <= idx < DELETED_LABEL:   # 255 nunca es una clase real, ver DELETED_LABEL
             h = sc.color.lstrip("#")
             r,g,b = int(h[0:2],16)/255., int(h[2:4],16)/255., int(h[4:6],16)/255.
             lut[idx] = [r,g,b,1.0]
-    lut[0] = [0.92,0.92,0.92,0.45]
+    lut[0] = [0.85,0.85,0.85,1.0]
     # Defensa en profundidad: compute_colors_u8() ya enmascara alpha=0 para
     # puntos eliminados en CUALQUIER modo, esto solo cubre por si algo usa
     # la LUT directamente sin pasar por ese wrapper.
@@ -381,14 +401,18 @@ def build_annotation_lut(schema_list):
 
 
 def build_annotation_lut_u8(schema_list):
-    """LUT (256,4) uint8 — ruta directa para render pipeline."""
-    lut = np.full((256,4), [235,235,235,115], dtype=np.uint8)
+    """LUT (256,4) uint8 — ruta directa para render pipeline.
+
+    Ver docstring de `build_annotation_lut` — mismo cambio: sin
+    etiquetar ahora es gris OPACO (alpha=255), no semi-transparente.
+    """
+    lut = np.full((256,4), [216,216,216,255], dtype=np.uint8)
     for sc in schema_list:
         idx = int(sc.id)
         if 0 <= idx < DELETED_LABEL:   # 255 nunca es una clase real, ver DELETED_LABEL
             h = sc.color.lstrip("#")
             r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
             lut[idx] = [r,g,b,255]
-    lut[0] = [235,235,235,115]
+    lut[0] = [216,216,216,255]
     lut[DELETED_LABEL] = [0, 0, 0, 0]
     return lut
