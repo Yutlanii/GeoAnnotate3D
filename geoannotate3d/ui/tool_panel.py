@@ -474,6 +474,7 @@ class ToolPanel(QWidget):
     point_size_changed      = pyqtSignal(float)
     show_unlabeled_toggled  = pyqtSignal(bool)
     grid_toggled            = pyqtSignal(bool)
+    edl_toggled              = pyqtSignal(bool)
     # Exportar
     export_requested        = pyqtSignal()
 
@@ -636,11 +637,21 @@ class ToolPanel(QWidget):
         for lbl_text, attr, default, sig in [
             ("Ver sin etiquetar", "_tog_unl",  True,  self.show_unlabeled_toggled),
             ("Grilla de fondo",   "_tog_grid", False, self.grid_toggled),
+            ("Eye-Dome Lighting", "_tog_edl",  False, self.edl_toggled),
         ]:
             row = QWidget(); row.setStyleSheet("background:transparent;")
             rl  = QHBoxLayout(row); rl.setContentsMargins(0, 2, 0, 2)
             ll = QLabel(lbl_text); ll.setStyleSheet(f"color:{TEXT_DIM}; font-size:10.5px;")
             tog = _Toggle(default); tog.toggled.connect(sig)
+            if attr == "_tog_edl":
+                # EDL es un término técnico (sombreado por profundidad) —
+                # explicar qué hace, igual que CloudCompare/Potree lo
+                # describen al usuario.
+                tip = ("Sombreado por profundidad: resalta el relieve/los "
+                       "bordes de la nube sin necesitar normales — más "
+                       "fácil de leer la geometría en modo Elevación o "
+                       "Color único. Tiene un costo de rendimiento leve.")
+                ll.setToolTip(tip); tog.setToolTip(tip)
             setattr(self, attr, tog)
             rl.addWidget(ll); rl.addStretch(); rl.addWidget(tog)
             vis_l.addWidget(row)

@@ -617,6 +617,41 @@ def test_delete_points_hidden_in_render():
               bool((out[20:25, 3] > 0).all()))
 
 
+def test_sor_outlier_detection():
+    """
+    Statistical Outlier Removal — mismo algoritmo que CloudCompare/PCL.
+    Nube sintética: un cluster denso (50K pts, ruido gaussiano ~1.0) +
+    200 puntos de "ruido" dispersos uniformemente en un volumen mucho
+    más grande — deben quedar aislados (distancia media a sus k
+    vecinos mucho mayor que el promedio de la nube). Verifica que la
+    detección separa correctamente ambos grupos, no solo que "corre
+    sin reventar".
+    """
+    from annotation.noise_filter import detect_outliers_sor
+
+    rng = np.random.default_rng(0)
+    n_dense = 50_000
+    dense = rng.normal(0, 1.0, size=(n_dense, 3)).astype(np.float32)
+    n_noise = 200
+    noise = rng.uniform(-50, 50, size=(n_noise, 3)).astype(np.float32)
+    xyz = np.vstack([dense, noise])
+
+    mask = detect_outliers_sor(xyz, k=8, std_ratio=2.0)
+
+    check("SOR: el cluster denso casi no tiene falsos positivos",
+          int(mask[:n_dense].sum()) < n_dense * 0.01,
+          f"{mask[:n_dense].sum()}/{n_dense} marcados")
+    check("SOR: el ruido disperso se detecta casi por completo",
+          int(mask[n_dense:].sum()) > n_noise * 0.95,
+          f"{mask[n_dense:].sum()}/{n_noise} marcados")
+
+    # Caso borde: nube vacía o casi vacía no debe reventar
+    empty = detect_outliers_sor(np.zeros((0, 3), np.float32))
+    check("SOR: nube vacía no revienta", len(empty) == 0)
+    tiny = detect_outliers_sor(np.zeros((2, 3), np.float32), k=8)
+    check("SOR: nube de 2 puntos (k>n) no revienta", len(tiny) == 2)
+
+
 def test_region_growing_performance_and_correctness():
     """
     Antes, `_grow()` construía la grilla espacial con un bucle Python
@@ -709,6 +744,7 @@ if __name__ == "__main__":
         test_confidence_color_mode,
         test_region_growing_performance_and_correctness,
         test_annotation_mode_unlabeled_points_are_opaque,
+        test_sor_outlier_detection,
     ]
     for t in tests:
         print(f"\n── {t.__name__} ──")
