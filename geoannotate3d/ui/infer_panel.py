@@ -37,10 +37,20 @@ from ui.theme import (
 # ── Worker de inferencia ──────────────────────────────────────────────────────
 
 class InferWorker(QThread):
-    """Corre la inferencia en background usando infer.py como librería."""
+    """
+    Corre la inferencia en background usando infer.py como librería.
+    Dos modos según cfg:
+      - cfg["pc"]: nube ya cargada en el canvas → al terminar emite
+        finished_ok(predictions, confidence) para que main_window la
+        aplique como anotación (label_store/proyecto existentes).
+      - cfg["single_file"]: archivo elegido en el panel, sin canvas/
+        proyecto asociado → el resultado se guarda directo a
+        cfg["single_out_path"] y se emite file_saved(out_path).
+    """
     progress    = pyqtSignal(float)       # 0-100
     log_line    = pyqtSignal(str)
     finished_ok = pyqtSignal(object, object)  # (predictions (N,) uint8, confidence (N,) float32|None)
+    file_saved  = pyqtSignal(str)         # ruta del .las guardado (modo single_file)
     error       = pyqtSignal(str)
 
     def __init__(self, config: dict):
@@ -74,17 +84,21 @@ class InferWorker(QThread):
         model, num_classes, class_names = infer_mod.load_model(cfg["model_path"], device)
         self.log_line.emit(f"[Inferencia] Clases: {num_classes} — {class_names}")
 
-        # ── Preparar cloud dict desde pc ─────────────────────────────────────
-        pc = cfg["pc"]
-        xyz       = pc.xyz.astype(np.float32)
-        intensity = pc.intensity if hasattr(pc, 'intensity') and pc.intensity is not None \
-                    else np.zeros(len(xyz), np.float32)
-        rgb = pc.rgb if hasattr(pc, 'rgb') and pc.rgb is not None else None
-
-        cloud = {"xyz": xyz, "intensity": intensity, "rgb": rgb}
+        # ── Preparar cloud dict: nube del canvas O archivo elegido en el panel
+        single_file = cfg.get("single_file")
+        if single_file:
+            self.log_line.emit(f"[Inferencia] Cargando nube: {single_file}")
+            cloud = infer_mod.load_cloud(single_file)
+        else:
+            pc = cfg["pc"]
+            xyz       = pc.xyz.astype(np.float32)
+            intensity = pc.intensity if hasattr(pc, 'intensity') and pc.intensity is not None \
+                        else np.zeros(len(xyz), np.float32)
+            rgb = pc.rgb if hasattr(pc, 'rgb') and pc.rgb is not None else None
+            cloud = {"xyz": xyz, "intensity": intensity, "rgb": rgb}
 
         # ── Inferencia por parches ────────────────────────────────────────────
-        self.log_line.emit(f"[Inferencia] {len(xyz):,} puntos · parches {cfg['pts']} · "
+        self.log_line.emit(f"[Inferencia] {len(cloud['xyz']):,} puntos · parches {cfg['pts']} · "
                            f"overlap {cfg['overlap']:.0%} · batch {cfg['batch']}")
 
         # Patch progress callback
@@ -124,7 +138,13 @@ class InferWorker(QThread):
         self.log_line.emit(f"[Inferencia] Completada — {int((predictions>0).sum()):,} "
                            f"puntos clasificados · confianza media "
                            f"{float(confidence.mean()):.0%}")
-        self.finished_ok.emit(predictions, confidence)
+
+        if single_file:
+            out_path = cfg["single_out_path"]
+            infer_mod.save_result(cloud, predictions, class_names, out_path)
+            self.file_saved.emit(out_path)
+        else:
+            self.finished_ok.emit(predictions, confidence)
 
 
 # ── Worker de inferencia por lote (carpeta completa) ───────────────────────────
@@ -239,10 +259,13 @@ class InferPanel(QWidget):
         self._model_path: Optional[str] = None
         self._batch_input_dir: Optional[str] = None
         self._batch_output_dir: Optional[str] = None
+        self._single_file_path: Optional[str] = None
         self._pc = None
         self._project = None
         self._start_t = 0.0
         self._build_ui()
+        self._update_source_label()
+        self._update_run_btn()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -304,6 +327,37 @@ class InferPanel(QWidget):
         self._model_info.setVisible(False)
         ml.addWidget(self._model_info)
         ll.addWidget(m_gb)
+
+        # Nube a clasificar — antes "Ejecutar inferencia" SIEMPRE usaba la
+        # nube ya cargada en el canvas (self._pc, vía set_context) y no
+        # había ninguna forma de elegir un archivo suelto desde este panel:
+        # si no había nada cargado en el canvas, ese botón quedaba
+        # deshabilitado sin explicación y solo "Ejecutar por lote" (que sí
+        # tiene su propio selector de carpeta) parecía funcionar. Ahora se
+        # puede elegir un archivo individual aquí mismo, sin depender del
+        # canvas — al terminar se guarda un .las clasificado en disco
+        # (como el modo lote, pero de un solo archivo), en vez de aplicarse
+        # como anotación (no hay proyecto/label_store para un archivo que
+        # nunca se cargó como nube activa).
+        s_gb, sl = self._card("Nube a clasificar", "cloud-check")
+        self._source_lbl = QLabel("")
+        self._source_lbl.setWordWrap(True)
+        self._source_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:10.5px;")
+        sl.addWidget(self._source_lbl)
+
+        src_row = QHBoxLayout(); src_row.setSpacing(6)
+        pick_btn = QPushButton("  Elegir archivo…")
+        pick_btn.setIcon(qicon("folder2", TEXT_DIM))
+        pick_btn.setStyleSheet(self._S_BTN)
+        pick_btn.clicked.connect(self._browse_single_file)
+        src_row.addWidget(pick_btn, 1)
+        self._clear_src_btn = QPushButton("Usar nube del canvas")
+        self._clear_src_btn.setStyleSheet(self._S_BTN)
+        self._clear_src_btn.setVisible(False)
+        self._clear_src_btn.clicked.connect(self._clear_single_file)
+        src_row.addWidget(self._clear_src_btn)
+        sl.addLayout(src_row)
+        ll.addWidget(s_gb)
 
         # Parámetros
         p_gb, pl = self._card("Parámetros de inferencia", "sliders2")
@@ -500,13 +554,46 @@ class InferPanel(QWidget):
         """Recibe la nube y el proyecto para la inferencia."""
         self._pc      = pc
         self._project = project
+        self._update_source_label()
         self._update_run_btn()
 
     def _update_run_btn(self):
-        ready = (self._model_path is not None and
-                 self._pc is not None and
-                 self._pc.n_points > 0)
+        has_source = (self._single_file_path is not None or
+                      (self._pc is not None and self._pc.n_points > 0))
+        ready = self._model_path is not None and has_source
         self._run_btn.setEnabled(ready)
+        self._run_btn.setText(
+            "  Ejecutar inferencia (archivo elegido)" if self._single_file_path is not None
+            else "  Ejecutar inferencia (nube del canvas)")
+
+    def _update_source_label(self):
+        if self._single_file_path is not None:
+            self._source_lbl.setText(f"Archivo: …/{Path(self._single_file_path).name}")
+            self._source_lbl.setToolTip(self._single_file_path)
+            self._clear_src_btn.setVisible(True)
+        elif self._pc is not None and self._pc.n_points > 0:
+            self._source_lbl.setText(f"Nube activa en el canvas — {self._pc.n_points:,} pts")
+            self._clear_src_btn.setVisible(False)
+        else:
+            self._source_lbl.setText(
+                "No hay ninguna nube cargada en el canvas. Elige un archivo abajo "
+                "o carga una nube antes de venir a este paso.")
+            self._clear_src_btn.setVisible(False)
+
+    def _browse_single_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Elegir nube a clasificar", "",
+            "Nubes de puntos (*.las *.laz *.ply *.npy *.txt *.csv *.xyz *.pts *.asc);;Todos (*)")
+        if not path:
+            return
+        self._single_file_path = path
+        self._update_source_label()
+        self._update_run_btn()
+
+    def _clear_single_file(self):
+        self._single_file_path = None
+        self._update_source_label()
+        self._update_run_btn()
 
     # ── Slots ────────────────────────────────────────────────────────────────
 
@@ -542,18 +629,29 @@ class InferPanel(QWidget):
         self._update_batch_btn()
 
     def _on_run(self):
-        if self._pc is None or self._model_path is None:
+        if self._model_path is None:
+            return
+        if self._single_file_path is None and self._pc is None:
             return
 
         device = self._dev_combo.currentData() or "cpu"
         cfg = {
             "model_path": self._model_path,
-            "pc":         self._pc,
             "pts":        self._pts_spin.value(),
             "overlap":    self._ov_spin.value(),
             "batch":      self._batch_spin.value(),
             "device":     device,
         }
+        if self._single_file_path is not None:
+            # Archivo suelto elegido en este panel: no hay proyecto/canvas
+            # asociado, así que el resultado se guarda directo a disco
+            # (como el modo lote, pero de un solo archivo) en vez de
+            # aplicarse como anotación — ver InferWorker._infer().
+            src = Path(self._single_file_path)
+            cfg["single_file"]     = str(src)
+            cfg["single_out_path"] = str(src.with_name(f"{src.stem}_classified.las"))
+        else:
+            cfg["pc"] = self._pc
 
         self._log.clear()
         self._progress.setValue(0)
@@ -566,6 +664,7 @@ class InferPanel(QWidget):
         self._worker.log_line.connect(self._on_log)
         self._worker.progress.connect(lambda p: self._progress.setValue(int(p)))
         self._worker.finished_ok.connect(self._on_done)
+        self._worker.file_saved.connect(self._on_file_saved)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -647,6 +746,17 @@ class InferPanel(QWidget):
         self._log.append(f"\n✓ Inferencia completada en {elapsed:.0f}s")
         self._log.append("Aplicando predicciones al canvas…")
         self.inference_done.emit(predictions, confidence)
+
+    def _on_file_saved(self, out_path: str) -> None:
+        """Terminó la inferencia de un archivo suelto (modo 'archivo elegido',
+        sin canvas/proyecto asociado) — el resultado ya se guardó a disco."""
+        self._timer.stop()
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._progress.setValue(100)
+        elapsed = time.time() - self._start_t
+        self._log.append(f"\n✓ Inferencia completada en {elapsed:.0f}s")
+        self._log.append(f"Guardado en: {out_path}")
 
     def _on_error(self, msg: str):
         self._timer.stop()

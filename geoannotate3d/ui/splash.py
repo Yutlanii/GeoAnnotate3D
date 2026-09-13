@@ -75,7 +75,7 @@ def _build_pixmap(progress: float = 0.0, msg: str = "Iniciando…") -> QPixmap:
 
     # Relleno de progreso — gradiente gris-cian, mismo ACCENT que el resto
     # de la app (rediseño 2026-09-05 v2). El overlay de fondo sigue oscuro
-    # aquí a propósito (igual que el viewport 3D — ver NOTES_CLAUDE.md):
+    # aquí a propósito (igual que el viewport 3D):
     # es la única forma de que el texto/barra sean legibles sobre la
     # imagen de marca, así que estos tonos son más claros/saturados que
     # el ACCENT plano para que resalten sobre negro, no una excepción al

@@ -50,8 +50,8 @@ class _ArchButton(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
         # ID-scoped selector: un setStyleSheet() sin selector en este
         # QWidget cascadearía su `border` a los QLabel hijos que no lo
-        # sobrescriben (mismo bug documentado en NOTES_CLAUDE.md — ver
-        # tool_panel.py/_card()), produciendo una caja dentro de otra
+        # sobrescriben (mismo bug ya visto en tool_panel.py/_card()),
+        # produciendo una caja dentro de otra
         # alrededor de cada línea de texto envuelta.
         self.setObjectName("archBtn")
 

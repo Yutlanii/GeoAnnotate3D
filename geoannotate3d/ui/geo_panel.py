@@ -57,7 +57,7 @@ class _AGLBar(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self); w, h = self.width(), self.height()
-        # Gradiente terreno→dosel — dato, no tema (ver NOTES_CLAUDE.md #23/24)
+        # Gradiente terreno→dosel — dato, no tema
         gr = QLinearGradient(0,0,w,0)
         gr.setColorAt(0.0, QColor("#5a3518")); gr.setColorAt(0.1, QColor("#8c6018"))
         gr.setColorAt(0.2, QColor("#78a018")); gr.setColorAt(0.5, QColor("#1a6c0e"))
@@ -78,6 +78,8 @@ class GeoPanel(QWidget):
     agl_auto_classify_requested = pyqtSignal()
     csf_classify_requested      = pyqtSignal()
     sor_detect_requested        = pyqtSignal(int, float)   # (k, std_ratio)
+    smooth_labels_requested     = pyqtSignal(int)           # (k)
+    isolated_clusters_requested = pyqtSignal(int, float)    # (max_cluster_size, connect_dist_m)
 
     _DEFAULT_LAYERS = [
         ("suelo",    ["suelo","ground","terreno","tierra","floor"],      -0.5,  0.3),
@@ -141,8 +143,7 @@ class GeoPanel(QWidget):
         # ── PASO 1: clasificar por capas AGL ──────────────────────────────────
         # (El antiguo "PASO 1 — Detectar el terreno" se quitó: no hacía
         # nada realmente — la clasificación AGL calcula la altura relativa
-        # al punto más bajo de la nube directamente, sin usar un MDT. Ver
-        # NOTES_CLAUDE.md.)
+        # al punto más bajo de la nube directamente, sin usar un MDT.)
         gb2, l2 = self._card("PASO 1 — Clasificar por altura (AGL)", "layers-half")
 
         l2.addWidget(self._desc(
@@ -287,6 +288,76 @@ class GeoPanel(QWidget):
             lambda: self.sor_detect_requested.emit(self._sor_k.value(), self._sor_ratio.value()))
         l4.addWidget(self._sor_btn)
         lay.addWidget(gb4)
+
+        # ── PASO 4: QA de anotación — suavizar + detectar clusters aislados ───
+        # Post-proceso estándar antes de exportar el dataset: limpia bordes
+        # ruidosos entre clases (suavizado) y señala posibles errores de
+        # anotación (clusters diminutos y aislados de una clase en medio de
+        # otra) — mismo espíritu que el "majority filter" de otras
+        # herramientas de segmentación de nubes de puntos.
+        gb5, l5 = self._card("PASO 4 — QA de anotación", "magic")
+
+        l5.addWidget(self._desc(
+            "Suavizado: cada punto etiquetado recalcula su clase como la "
+            "mayoritaria entre sus vecinos — limpia bordes ruidosos entre "
+            "clases. Nunca toca puntos sin etiquetar ni eliminados."))
+
+        smooth_k_row = QHBoxLayout(); smooth_k_row.setSpacing(6)
+        smooth_k_lbl = QLabel("Vecinos (k):")
+        smooth_k_lbl.setStyleSheet(f"color:{TEXT_MUTE};font-size:10px;background:transparent;")
+        smooth_k_row.addWidget(smooth_k_lbl)
+        self._smooth_k = QSpinBox()
+        self._smooth_k.setRange(3, 30); self._smooth_k.setValue(8)
+        self._smooth_k.setStyleSheet(
+            f"QSpinBox{{background:{SURFACE_2};border:1px solid {BORDER};border-radius:3px;"
+            f"color:{TEXT_DIM};padding:3px 6px;font-size:10px;}}"
+            f"QSpinBox:hover{{border-color:{ACCENT};}}")
+        smooth_k_row.addWidget(self._smooth_k, 1)
+        l5.addLayout(smooth_k_row)
+
+        self._smooth_btn = QPushButton("  Suavizar etiquetas")
+        self._smooth_btn.setIcon(qicon("magic", ACCENT_STRONG))
+        self._smooth_btn.setStyleSheet(
+            f"QPushButton{{background:{ACCENT_SOFT};border:1px solid {ACCENT_SOFT};"
+            f"border-radius:4px;color:{ACCENT_STRONG};padding:8px;font-size:10.5px;font-weight:600;}}"
+            f"QPushButton:hover{{border-color:{ACCENT};}}"
+            f"QPushButton:disabled{{background:{SURFACE_2};color:{TEXT_MUTE};border-color:{SURFACE_2};}}")
+        self._smooth_btn.clicked.connect(
+            lambda: self.smooth_labels_requested.emit(self._smooth_k.value()))
+        l5.addWidget(self._smooth_btn)
+
+        sep5 = QFrame(); sep5.setFrameShape(QFrame.HLine)
+        sep5.setStyleSheet(f"background:{BORDER_SOFT}; max-height:1px; margin-top:6px; margin-bottom:2px;")
+        l5.addWidget(sep5)
+
+        l5.addWidget(self._desc(
+            "Detectar clusters aislados: por cada clase, busca grupos "
+            "diminutos y aislados de esa clase — candidatos a error de "
+            "anotación (ej. un clic accidental). No borra nada, solo reporta."))
+
+        iso_row = QHBoxLayout(); iso_row.setSpacing(6)
+        iso_lbl = QLabel("Máx. puntos/cluster:")
+        iso_lbl.setStyleSheet(f"color:{TEXT_MUTE};font-size:10px;background:transparent;")
+        iso_row.addWidget(iso_lbl)
+        self._iso_max = QSpinBox()
+        self._iso_max.setRange(1, 500); self._iso_max.setValue(15)
+        self._iso_max.setStyleSheet(
+            f"QSpinBox{{background:{SURFACE_2};border:1px solid {BORDER};border-radius:3px;"
+            f"color:{TEXT_DIM};padding:3px 6px;font-size:10px;}}"
+            f"QSpinBox:hover{{border-color:{ACCENT};}}")
+        iso_row.addWidget(self._iso_max, 1)
+        l5.addLayout(iso_row)
+
+        self._iso_btn = QPushButton("  Detectar clusters aislados")
+        self._iso_btn.setIcon(qicon("magic", ACCENT_STRONG))
+        self._iso_btn.setStyleSheet(
+            f"QPushButton{{background:{SURFACE_2};border:1px solid {BORDER};"
+            f"border-radius:4px;color:{TEXT_DIM};padding:8px;font-size:10.5px;font-weight:600;}}"
+            f"QPushButton:hover{{border-color:{ACCENT};}}")
+        self._iso_btn.clicked.connect(
+            lambda: self.isolated_clusters_requested.emit(self._iso_max.value(), 1.0))
+        l5.addWidget(self._iso_btn)
+        lay.addWidget(gb5)
 
         lay.addStretch()
 

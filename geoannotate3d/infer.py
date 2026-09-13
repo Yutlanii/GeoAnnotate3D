@@ -304,10 +304,27 @@ def load_model(ckpt_path: str, device: str):
             return self.clf(f0u)
 
     # ── KPConv inline ─────────────────────────────────────────────────────────
-    def knn_idx_kp(xyz, k):
-        B,_,N=xyz.shape; k=min(k,N-1); xy=xyz.permute(0,2,1)
-        dist=(xy.unsqueeze(2)-xy.unsqueeze(1)).pow(2).sum(-1)
-        return dist.topk(k+1,dim=-1,largest=False).indices[:,:,1:]
+    def knn_idx_kp(xyz, k, chunk=2048):
+        """
+        KNN (B,3,N) → (B,N,k) por bloques de filas — NO armar la matriz de
+        distancias completa (B,N,N) de una sola vez: para un parche grande
+        (N puede llegar a 65536, ver "Pts/parche" en el panel de
+        inferencia/entrenamiento) esa matriz completa pesa B·N² floats —
+        confirmado en la práctica: CUDA OOM pidiendo 32 GiB en una GPU de
+        8GB. Mismo fix que ui/training_panel.py::_build_kpconv (esta es
+        una copia separada del modelo, para poder cargar el checkpoint sin
+        depender de la UI — el fix anterior solo tocó la copia de
+        entrenamiento, no esta).
+        """
+        B,_,N = xyz.shape; k = min(k, N-1)
+        xy = xyz.permute(0,2,1)   # (B,N,3)
+        idx_chunks = []
+        for start in range(0, N, chunk):
+            end   = min(start+chunk, N)
+            block = xy[:, start:end]                                   # (B,c,3)
+            dist  = (block.unsqueeze(2) - xy.unsqueeze(1)).pow(2).sum(-1)  # (B,c,N)
+            idx_chunks.append(dist.topk(k+1, dim=-1, largest=False).indices[:,:,1:])
+        return torch.cat(idx_chunks, dim=1)   # (B,N,k)
 
     class KPConvLayer(nn.Module):
         def __init__(self,in_ch,out_ch,k=16,sigma=0.1):
@@ -464,15 +481,52 @@ def infer_cloud(model, cloud: dict, num_classes: int,
     patches_done = 0
     t_start      = time.time()
 
+    n_oom_skipped = [0]   # parches definitivamente saltados por falta de VRAM (lista para closure)
+
+    def _run_sub_batch(feats_list, idxs_list):
+        """
+        Corre un sub-batch por el modelo. Si CUDA se queda sin memoria,
+        lo parte a la mitad y reintenta cada mitad por separado
+        (recursivo) en vez de abortar TODA la inferencia — así, sin
+        importar cuánta VRAM tenga la GPU ni qué tan grande sea la nube,
+        el "Batch" configurado se va reduciendo solo para los parches que
+        de verdad lo necesitan, mientras el resto sigue al tamaño normal
+        (más rápido). Si un solo parche (batch de 1) sigue sin entrar
+        —GPU realmente muy chica para el "Pts/parche" elegido—, se salta
+        ese parche (no revienta la corrida entera): sus puntos quedan
+        "sin cobertura" y el propio infer_cloud ya los rellena después
+        propagando la etiqueta del vecino cubierto más cercano (ver abajo).
+        """
+        if not feats_list:
+            return
+        try:
+            with torch.no_grad():
+                X = torch.from_numpy(np.stack(feats_list)).to(device)  # (B, N, 9)
+                X = X.permute(0, 2, 1)                                  # (B, 9, N)
+                logits = model(X).permute(0, 2, 1).cpu().numpy()        # (B, N, C)
+            for i, patch_idx in enumerate(idxs_list):
+                logit_sum[patch_idx] += logits[i]
+                vote_cnt[patch_idx]  += 1
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            torch.cuda.empty_cache()
+            if len(feats_list) == 1:
+                n_oom_skipped[0] += 1
+                print(f"[Inferencia] Sin VRAM ni para 1 parche de {pts} pts "
+                      f"(GPU muy chica para este 'Pts/parche') — saltando, se "
+                      f"rellena luego con el vecino más cercano cubierto.")
+                return
+            mid = len(feats_list) // 2
+            print(f"[Inferencia] CUDA sin memoria con batch={len(feats_list)} — "
+                  f"reintentando en 2 mitades ({mid}/{len(feats_list)-mid})")
+            _run_sub_batch(feats_list[:mid], idxs_list[:mid])
+            torch.cuda.empty_cache()
+            _run_sub_batch(feats_list[mid:], idxs_list[mid:])
+
     def run_batch():
         if not batch_feats: return
-        with torch.no_grad():
-            X = torch.from_numpy(np.stack(batch_feats)).to(device)  # (B, N, 9)
-            X = X.permute(0, 2, 1)                                   # (B, 9, N)
-            logits = model(X).permute(0, 2, 1).cpu().numpy()         # (B, N, C)
-        for i, patch_idx in enumerate(batch_idxs):
-            logit_sum[patch_idx] += logits[i]
-            vote_cnt[patch_idx]  += 1
+        _run_sub_batch(list(batch_feats), list(batch_idxs))
 
     for ci, (cx, cy) in enumerate(centers):
         # Encontrar puntos en el radio de la celda
@@ -527,6 +581,10 @@ def infer_cloud(model, cloud: dict, num_classes: int,
 
     # Último batch
     run_batch()
+
+    if n_oom_skipped[0] > 0:
+        print(f"[Inferencia] {n_oom_skipped[0]} parche(s) saltado(s) por falta "
+              f"de VRAM — sus puntos se rellenan por vecino más cercano abajo.")
 
     # ── Puntos sin predicción → buscar vecino más cercano ─────────────────────
     uncovered = np.where(vote_cnt == 0)[0]

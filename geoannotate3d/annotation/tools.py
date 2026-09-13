@@ -122,23 +122,44 @@ class BaseTool:
     def _snap_to_point(self, screen_pos,
                        radius_px: float = SNAP_SCREEN_R) -> Optional[np.ndarray]:
         """Snap al punto real más cercano (submuestra para velocidad)."""
+        p, _idx = self._snap_to_point_idx(screen_pos, radius_px)
+        return p
+
+    def _snap_to_point_idx(self, screen_pos, radius_px: float = SNAP_SCREEN_R
+                           ) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        """
+        Igual que `_snap_to_point`, pero además devuelve el índice GLOBAL
+        (dentro de pc.xyz / project.labels) del punto real encontrado —
+        necesario para herramientas como Pick que necesitan leer atributos
+        (clasificación, intensidad…) de exactamente ese punto, sin volver a
+        buscarlo por coordenadas (frágil: la posición que se muestra puede
+        ser un promedio de varios puntos, no la de uno solo).
+        `c._cur_idx[i]` es el índice global correspondiente a `c._cur_xyz[i]`
+        (ver render/canvas.py, siempre se asignan juntos) — por eso alcanza
+        con submuestrear ambos arrays EN SINCRONÍA en vez de reconsultar
+        pc.xyz.
+        """
         c = self.canvas
         if c is None or c._cur_xyz is None:
-            return None
+            return None, None
         try:
-            xyz  = c._cur_xyz
-            n    = len(xyz)
+            xyz = c._cur_xyz
+            gi  = c._cur_idx
+            n   = len(xyz)
             step = max(1, n // 200_000)
             sub  = xyz[::step]
+            sub_idx = gi[::step] if gi is not None and len(gi) == n else None
             sc   = c.map_to_screen(sub)
             sx, sy = float(screen_pos[0]), float(screen_pos[1])
             d2 = (sc[:, 0] - sx) ** 2 + (sc[:, 1] - sy) ** 2
             bi = int(np.argmin(d2))
             if d2[bi] <= radius_px ** 2:
-                return sub[bi].copy()
+                pos = sub[bi].copy()
+                idx = int(sub_idx[bi]) if sub_idx is not None else None
+                return pos, idx
         except Exception:
             pass
-        return None
+        return None, None
 
     def _get_projection_matrix(self) -> Optional[np.ndarray]:
         """Devuelve MVP 4×4 float64 para proyectar puntos mundo → pantalla."""
@@ -1060,12 +1081,20 @@ class PickTool(BaseTool):
         if event.button != 1: return
         c = self.canvas
         if c is None or c.pc is None: return
-        p = self._world_pos(event.pos, fast=False)
+        # Preferir el snap al punto REAL más cercano (con su índice global)
+        # sobre el promedio de vecinos de _world_pos — así la clasificación
+        # que se muestra corresponde exactamente al punto elegido, en vez
+        # de tener que volver a buscarlo por coordenadas (ver point_picked_abs
+        # en render/canvas.py para el porqué de este cambio).
+        p, gidx = self._snap_to_point_idx(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos, fast=False)
+            gidx = None
         if p is None: return
         abs_xyz = p.astype(np.float64) + c.pc.offset
         c.sig.point_picked.emit(float(p[0]), float(p[1]), float(p[2]))
         c.sig.point_picked_abs.emit(
-            float(abs_xyz[0]), float(abs_xyz[1]), float(abs_xyz[2]))
+            float(abs_xyz[0]), float(abs_xyz[1]), float(abs_xyz[2]), gidx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1076,11 +1105,17 @@ class MeasureTool(BaseTool):
     """
     Mide distancia 3D, distancia horizontal y diferencia de altura.
     Clic A → clic B → muestra resultado.
+
+    Ctrl+clic sobre una medida YA EXISTENTE (solo si no hay una en curso)
+    la edita (color/grosor) o la elimina — antes una medida, una vez
+    creada, no se podía borrar de ninguna forma.
     """
     name    = "Medir"
     key     = "M"
     icon    = "ruler"
-    tooltip = "Ctrl+clic A · clic B para medir distancia"
+    tooltip = "Ctrl+clic A · clic B mide · Ctrl+clic sobre una ya puesta la edita"
+
+    _EDIT_RADIUS_PX = 14.0
 
     def __init__(self):
         super().__init__()
@@ -1094,6 +1129,13 @@ class MeasureTool(BaseTool):
         if event.button != 1: return
         c = self.canvas
         if c is None: return
+
+        if self._p1 is None:
+            existing = self._find_nearby_measure(event.pos)
+            if existing is not None:
+                self._edit_marker(existing)
+                return
+
         p = self._snap_to_point(event.pos)
         if p is None:
             p = self._world_pos(event.pos, fast=False)
@@ -1114,6 +1156,14 @@ class MeasureTool(BaseTool):
             seg = np.array([self._p1, p], np.float32)
             c._mline.set_data(seg, color=(1.0, 0.9, 0.2, 1.0))
             c._mline.visible = True
+            # Persistir la medida (ver annotation/markers.py) — antes esto
+            # se perdía en cuanto medías otra cosa o cambiabas de
+            # herramienta; ahora queda anclada en 3D y se guarda con el
+            # proyecto, igual que en CloudCompare/Cyclone 3DR.
+            marker_store = getattr(c, "marker_store", None)
+            if marker_store is not None:
+                marker_store.add_measure(
+                    self._p1, p, text=f"{d3d:.2f} m")
             c.update()
             self._p1 = None
 
@@ -1136,6 +1186,227 @@ class MeasureTool(BaseTool):
             self._p1 = None
             self._clear_overlays()
 
+    def _find_nearby_measure(self, screen_pos):
+        """Medida existente más cercana al clic en pantalla (distancia al
+        SEGMENTO A-B, no solo a sus extremos — ver PolylineTool._find_nearby_polyline
+        para el porqué)."""
+        c = self.canvas
+        store = getattr(c, "marker_store", None)
+        if store is None or len(store) == 0:
+            return None
+        measures = [m for m in store.all() if m.kind == "measure" and m.pos_b is not None]
+        if not measures:
+            return None
+        sx, sy = float(screen_pos[0]), float(screen_pos[1])
+        best, best_d2 = None, self._EDIT_RADIUS_PX ** 2
+        for m in measures:
+            try:
+                sc = c.map_to_screen(np.array([m.pos, m.pos_b], np.float32))
+            except Exception:
+                continue
+            d2 = _point_segment_dist2(sx, sy, sc[0, 0], sc[0, 1], sc[1, 0], sc[1, 1])
+            if d2 < best_d2:
+                best, best_d2 = m, d2
+        return best
+
+    def _edit_marker(self, marker) -> None:
+        c = self.canvas
+        try:
+            dlg = _LineMarkerEditDialog(c, "Editar medida", color=tuple(marker.color),
+                                       line_width=getattr(marker, "line_width", 2.5),
+                                       delete_label="Eliminar medida",
+                                       color_title="Color de la medida")
+            accepted, deleted, color, line_width = dlg.exec()
+        except Exception:
+            return
+        if not accepted:
+            return
+        if deleted:
+            c.marker_store.remove(marker.id)
+            return
+        c.marker_store.update(marker.id, color=list(color), line_width=line_width)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LabelMarkerTool — etiqueta de texto persistente en 3D
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _LabelMarkerDialog:
+    """
+    Diálogo combinado (texto + tamaño de letra + color) usado tanto al
+    CREAR una etiqueta nueva como al EDITAR una ya existente — mismo
+    formulario en los dos casos, para que el tamaño/color se puedan fijar
+    desde antes de crearla o cambiar después sin duplicar UI.
+    """
+    def __init__(self, parent, title, text="", color=(1.0, 0.85, 0.2), font_size=14.0):
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QLineEdit, QSpinBox, QPushButton, QDialogButtonBox)
+        from PyQt5.QtGui import QColor
+
+        self._color = tuple(color)
+        self._QColor = QColor
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle(title)
+        lay = QVBoxLayout(dlg)
+
+        lay.addWidget(QLabel("Texto:"))
+        self._text_edit = QLineEdit(text)
+        lay.addWidget(self._text_edit)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Tamaño de letra:"))
+        self._size_spin = QSpinBox()
+        self._size_spin.setRange(8, 48)
+        self._size_spin.setValue(int(font_size))
+        size_row.addWidget(self._size_spin)
+        lay.addLayout(size_row)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(50, 22)
+        self._update_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        color_row.addWidget(self._color_btn)
+        color_row.addStretch()
+        lay.addLayout(color_row)
+
+        del_btn = QPushButton("Eliminar etiqueta")
+        del_btn.setStyleSheet("QPushButton{color:#c0392b;}")
+        del_btn.clicked.connect(lambda: self._mark_deleted(dlg))
+        lay.addWidget(del_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        self._dlg = dlg
+        self._deleted = False
+
+    def _mark_deleted(self, dlg):
+        self._deleted = True
+        dlg.accept()
+
+    def _update_color_btn(self):
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._color)
+        self._color_btn.setStyleSheet(
+            f"background: rgb({r},{g},{b}); border: 1px solid #888; border-radius: 3px;")
+
+    def _pick_color(self):
+        from PyQt5.QtWidgets import QColorDialog
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._color)
+        picked = QColorDialog.getColor(self._QColor(r, g, b), self._dlg, "Color de la etiqueta")
+        if picked.isValid():
+            self._color = (picked.redF(), picked.greenF(), picked.blueF())
+            self._update_color_btn()
+
+    def exec(self):
+        """Devuelve (accepted, deleted, text, color, font_size)."""
+        accepted = bool(self._dlg.exec_())
+        return (accepted, self._deleted, self._text_edit.text().strip(), self._color,
+                float(self._size_spin.value()))
+
+
+class LabelMarkerTool(BaseTool):
+    """
+    Ctrl+clic: coloca una etiqueta de texto persistente en ese punto —
+    visible permanentemente (hasta que se borre) y guardada con el
+    proyecto (ver annotation/markers.py::MarkerStore). A diferencia de
+    PickTool (que solo inspecciona), esto deja una marca anotada en el
+    espacio, igual que las "text labels" de CloudCompare o las
+    anotaciones de Cyclone 3DR.
+
+    Ctrl+clic sobre una etiqueta YA EXISTENTE la EDITA en vez de crear
+    una nueva (mismo diálogo, precargado con su texto/tamaño/color).
+    El tamaño y color elegidos se recuerdan para la siguiente etiqueta
+    nueva que coloques con esta misma herramienta.
+    """
+    name    = "Etiqueta 3D"
+    key     = "N"
+    icon    = "tag"
+    tooltip = ("Ctrl+clic → coloca una etiqueta de texto persistente en 3D · "
+               "Ctrl+clic sobre una etiqueta existente → la edita")
+
+    _EDIT_RADIUS_PX = 26.0
+
+    def __init__(self):
+        super().__init__()
+        self.color:     tuple = (1.0, 0.85, 0.2)
+        self.font_size: float = 14.0
+
+    def on_mouse_press(self, event):
+        if event.button != 1:
+            return
+        c = self.canvas
+        if c is None:
+            return
+        marker_store = getattr(c, "marker_store", None)
+        if marker_store is None:
+            return
+
+        existing = self._find_nearby_label(event.pos)
+        if existing is not None:
+            self._edit_marker(existing)
+            return
+
+        p = self._snap_to_point(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos, fast=False)
+        if p is None:
+            return
+        try:
+            dlg = _LabelMarkerDialog(c, "Etiqueta 3D", text="",
+                                     color=self.color, font_size=self.font_size)
+            accepted, _deleted, text, color, font_size = dlg.exec()
+        except Exception:
+            return
+        if accepted and text:
+            marker_store.add_label(p, text, color=color, font_size=font_size)
+            # Recordar tamaño/color para la próxima etiqueta que coloques.
+            self.color, self.font_size = color, font_size
+            if hasattr(c, "update"):
+                c.update()
+
+    def _find_nearby_label(self, screen_pos):
+        """Etiqueta existente más cercana al clic en pantalla, si hay
+        alguna dentro de _EDIT_RADIUS_PX — para editar en vez de crear."""
+        c = self.canvas
+        store = getattr(c, "marker_store", None)
+        if store is None or len(store) == 0:
+            return None
+        labels = [m for m in store.all() if m.kind == "label"]
+        if not labels:
+            return None
+        try:
+            positions = np.array([m.pos for m in labels], np.float32)
+            sc = c.map_to_screen(positions)
+            sx, sy = float(screen_pos[0]), float(screen_pos[1])
+            d2 = (sc[:, 0] - sx) ** 2 + (sc[:, 1] - sy) ** 2
+            bi = int(np.argmin(d2))
+            if d2[bi] <= self._EDIT_RADIUS_PX ** 2:
+                return labels[bi]
+        except Exception:
+            pass
+        return None
+
+    def _edit_marker(self, marker) -> None:
+        c = self.canvas
+        try:
+            dlg = _LabelMarkerDialog(c, "Editar etiqueta 3D", text=marker.text,
+                                     color=tuple(marker.color), font_size=marker.font_size)
+            accepted, deleted, text, color, font_size = dlg.exec()
+        except Exception:
+            return
+        if not accepted:
+            return
+        if deleted:
+            c.marker_store.remove(marker.id)
+            return
+        if text:
+            c.marker_store.update(marker.id, text=text, color=list(color), font_size=font_size)
+            self.color, self.font_size = color, font_size
 
 
 class DiscTool(BaseTool):
@@ -1264,8 +1535,437 @@ class DiscTool(BaseTool):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Import RegionGrowingTool
+# PolylineTool — polilínea persistente en 3D (centerlines: caminos, líneas
+# eléctricas, taludes...)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _LineMarkerEditDialog:
+    """
+    Diálogo para editar el color y grosor de una marca "de línea" YA
+    creada — polilínea O medida — (o fijarlos de antemano para la
+    próxima). Mismo patrón que _LabelMarkerDialog, pero con un spinbox
+    de grosor de línea en vez de tamaño de letra, y sin campo de texto
+    (ninguna de las dos necesita uno tan prominente como una etiqueta;
+    su descripción — longitud/vértices, o distancia — se recalcula
+    sola). Incluye un botón "Eliminar" para borrarla del todo en el
+    mismo diálogo, en vez de tener que buscar otra forma — antes NINGÚN
+    marcador de línea (ni medida ni polilínea) se podía borrar una vez
+    creado, solo las etiquetas de texto.
+    """
+    def __init__(self, parent, title, color=(0.2, 0.85, 1.0), line_width=2.5,
+                allow_delete=True, delete_label="Eliminar", color_title="Color"):
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QDoubleSpinBox, QPushButton, QDialogButtonBox)
+        from PyQt5.QtGui import QColor
+
+        self._color = tuple(color)
+        self._QColor = QColor
+        self._deleted = False
+        self._color_title = color_title
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle(title)
+        lay = QVBoxLayout(dlg)
+
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("Grosor de línea:"))
+        self._width_spin = QDoubleSpinBox()
+        self._width_spin.setRange(0.5, 12.0)
+        self._width_spin.setSingleStep(0.5)
+        self._width_spin.setValue(float(line_width))
+        width_row.addWidget(self._width_spin)
+        lay.addLayout(width_row)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(50, 22)
+        self._update_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        color_row.addWidget(self._color_btn)
+        color_row.addStretch()
+        lay.addLayout(color_row)
+
+        if allow_delete:
+            del_btn = QPushButton(delete_label)
+            del_btn.setStyleSheet("QPushButton{color:#c0392b;}")
+            del_btn.clicked.connect(lambda: self._mark_deleted(dlg))
+            lay.addWidget(del_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        self._dlg = dlg
+
+    def _mark_deleted(self, dlg):
+        self._deleted = True
+        dlg.accept()
+
+    def _update_color_btn(self):
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._color)
+        self._color_btn.setStyleSheet(
+            f"background: rgb({r},{g},{b}); border: 1px solid #888; border-radius: 3px;")
+
+    def _pick_color(self):
+        from PyQt5.QtWidgets import QColorDialog
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._color)
+        picked = QColorDialog.getColor(self._QColor(r, g, b), self._dlg, self._color_title)
+        if picked.isValid():
+            self._color = (picked.redF(), picked.greenF(), picked.blueF())
+            self._update_color_btn()
+
+    def exec(self):
+        """Devuelve (accepted, deleted, color, line_width)."""
+        accepted = bool(self._dlg.exec_())
+        return (accepted, self._deleted, self._color, float(self._width_spin.value()))
+
+
+class PolylineTool(BaseTool):
+    """
+    Digitaliza una polilínea abierta de varios vértices sobre la nube —
+    a diferencia de PolygonTool (cierra un área para SELECCIONAR puntos
+    dentro), esto no selecciona nada: deja una marca persistente (ver
+    annotation/markers.py) para digitalizar centerlines — el eje de un
+    camino, el trazo de una línea eléctrica, el borde de un talud — que
+    con solo un segmento (MeasureTool) o un punto (LabelMarkerTool) no
+    se puede representar bien.
+
+    Ctrl+clic (nube vacía): agrega un vértice. Enter: termina y la deja
+    guardada. Escape: cancela la polilínea en curso. Backspace: quita el
+    último vértice puesto (sin cancelar todo). Ctrl+clic sobre una
+    polilínea YA EXISTENTE (solo si no hay una en curso) la edita —
+    color, grosor, o eliminarla — en vez de empezar una nueva.
+    """
+    name    = "Polilínea"
+    # Letra libre — B/L/X/H/C/G/I/M/N/D/P ya están tomadas por otras
+    # herramientas, y F/V/Y/R/espacio/1-9 los intercepta la cámara antes
+    # de llegar al mapa de herramientas (ver _AnnotationStyle._on_key en
+    # render/canvas.py) — no hay una letra "mnemónica" libre para esto.
+    key     = "K"
+    icon    = "diagram-3"
+    tooltip = ("Ctrl+clic agrega un vértice · Enter termina · Backspace quita "
+              "el último · Escape cancela · Ctrl+clic sobre una ya puesta la edita")
+
+    _EDIT_RADIUS_PX = 14.0   # distancia máx. a un SEGMENTO (no solo vértice)
+
+    def __init__(self):
+        super().__init__()
+        self._pts: list = []
+        self.color:      tuple = (0.2, 0.85, 1.0)
+        self.line_width: float = 2.5
+
+    def on_mouse_press(self, event):
+        if event.button != 1:
+            return
+        c = self.canvas
+        if c is None:
+            return
+
+        if not self._pts:
+            existing = self._find_nearby_polyline(event.pos)
+            if existing is not None:
+                self._edit_marker(existing)
+                return
+
+        p = self._snap_to_point(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos, fast=False)
+        if p is None:
+            p = self._screen_to_world_fallback(event.pos)
+        if p is None:
+            return
+        self._pts.append(p.astype(np.float32))
+        self._redraw_preview()
+
+    def on_mouse_move(self, event):
+        c = self.canvas
+        if c is None or not self._pts:
+            return
+        p = self._snap_to_point(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos)
+        if p is None:
+            p = self._screen_to_world_fallback(event.pos)
+        if p is None:
+            return
+        seg = np.array([self._pts[-1], p], np.float32)
+        c._mline_live.set_data(seg, color=(*self.color, 0.5), width=self.line_width)
+        c._mline_live.visible = True
+        c.update()
+
+    def _redraw_preview(self):
+        c = self.canvas
+        if c is None:
+            return
+        if len(self._pts) >= 2:
+            c._mline.set_data(np.array(self._pts, np.float32),
+                              color=(*self.color, 0.9), width=self.line_width)
+            c._mline.visible = True
+        else:
+            # Un solo vértice: nada que conectar todavía, pero limpiar
+            # cualquier trazo previo (p.ej. tras un Backspace que dejó
+            # solo 1 punto) para que no quede una línea vieja fantasma.
+            c._mline.visible = False
+        c.update()
+
+    def on_key_press(self, event):
+        key = getattr(event, "key", "")
+        if key == "Escape":
+            self._pts = []
+            self._clear_overlays()
+            return
+        if key in ("Return", "Enter"):
+            self._finish()
+            return
+        if key == "BackSpace" and self._pts:
+            self._pts.pop()
+            if not self._pts:
+                self._clear_overlays()
+            else:
+                self._redraw_preview()
+                c = self.canvas
+                if c is not None:
+                    c._mline_live.visible = False
+                    c.update()
+
+    def _finish(self) -> None:
+        c = self.canvas
+        if c is None or len(self._pts) < 2:
+            self._pts = []
+            self._clear_overlays()
+            return
+        marker_store = getattr(c, "marker_store", None)
+        if marker_store is not None:
+            length = float(sum(
+                np.linalg.norm(self._pts[i + 1] - self._pts[i])
+                for i in range(len(self._pts) - 1)))
+            marker_store.add_polyline(
+                self._pts, text=f"{length:.2f} m, {len(self._pts)} vértices",
+                color=self.color, line_width=self.line_width)
+        self._pts = []
+        self._clear_overlays()
+
+    def _find_nearby_polyline(self, screen_pos):
+        """
+        Polilínea existente más cercana al clic en pantalla — a
+        diferencia de LabelMarkerTool._find_nearby_label (que solo mira
+        UN punto por marcador), aquí hay que revisar la distancia del
+        clic a cada SEGMENTO de cada polilínea, no solo a sus vértices,
+        porque el punto medio de un segmento largo puede estar lejos de
+        ambos vértices y aun así ser "sobre la línea" a ojo.
+        """
+        c = self.canvas
+        store = getattr(c, "marker_store", None)
+        if store is None or len(store) == 0:
+            return None
+        polylines = [m for m in store.all() if m.kind == "polyline" and m.points]
+        if not polylines:
+            return None
+        sx, sy = float(screen_pos[0]), float(screen_pos[1])
+        best, best_d2 = None, self._EDIT_RADIUS_PX ** 2
+        for m in polylines:
+            try:
+                sc = c.map_to_screen(np.array(m.points, np.float32))
+            except Exception:
+                continue
+            for i in range(len(sc) - 1):
+                d2 = _point_segment_dist2(sx, sy, sc[i, 0], sc[i, 1], sc[i+1, 0], sc[i+1, 1])
+                if d2 < best_d2:
+                    best, best_d2 = m, d2
+        return best
+
+    def _edit_marker(self, marker) -> None:
+        c = self.canvas
+        try:
+            dlg = _LineMarkerEditDialog(c, "Editar polilínea", color=tuple(marker.color),
+                                      line_width=getattr(marker, "line_width", 2.5),
+                                      delete_label="Eliminar polilínea",
+                                      color_title="Color de la polilínea")
+            accepted, deleted, color, line_width = dlg.exec()
+        except Exception:
+            return
+        if not accepted:
+            return
+        if deleted:
+            c.marker_store.remove(marker.id)
+            return
+        c.marker_store.update(marker.id, color=list(color), line_width=line_width)
+        self.color, self.line_width = color, line_width
+
+    def deactivate(self):
+        # Terminar/descartar como Escape si se cambia de herramienta con
+        # una polilínea a medio trazar, en vez de dejarla "colgada" sin
+        # guardar y sin overlay visible tampoco (ninguna de las dos cosas
+        # sería lo que el usuario esperaría).
+        self._pts = []
+        super().deactivate()
+
+
+def _point_segment_dist2(px, py, ax, ay, bx, by) -> float:
+    """Distancia² (en pantalla) de (px,py) al segmento A-B — usado para
+    encontrar a qué polilínea corresponde un clic sobre cualquier parte
+    de su trazo, no solo sus vértices."""
+    dx, dy = bx - ax, by - ay
+    seg_len2 = dx * dx + dy * dy
+    if seg_len2 < 1e-9:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len2))
+    cx, cy = ax + t * dx, ay + t * dy
+    return (px - cx) ** 2 + (py - cy) ** 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ProfileTool — vista de perfil / corte vertical
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProfileTool(BaseTool):
+    """
+    Traza una línea A→B (Ctrl+clic A, clic B — igual que MeasureTool) y
+    abre una ventana con el corte vertical de la franja de la nube
+    alrededor de esa línea: distancia a lo largo de la línea en el eje
+    X, altura (Z) en el eje Y. Útil para revisar taludes, líneas
+    eléctricas, secciones de vía, perfiles de terreno, sin tener que
+    girar la cámara 3D a un ángulo lateral incómodo para "ver de canto".
+
+    El ancho de la franja (buffer perpendicular a la línea) es ajustable
+    desde el panel de herramientas (ver ui/tool_panel.py, sección de
+    contexto "Perfil"), igual que el radio del Pincel/Disco.
+    """
+    name    = "Perfil"
+    key     = "O"   # letra libre — ver comentario de PolylineTool arriba
+    icon    = "graph-up"
+    tooltip = "Ctrl+clic A · clic B → abre el corte vertical de la franja entre A y B"
+
+    def __init__(self):
+        super().__init__()
+        self._p1: Optional[np.ndarray] = None
+        self.buffer_m: float = 2.0
+        self._dialog = None   # se reusa entre perfiles sucesivos
+
+    def deactivate(self):
+        self._p1 = None
+        super().deactivate()
+
+    def on_mouse_press(self, event):
+        if event.button != 1:
+            return
+        c = self.canvas
+        if c is None:
+            return
+        p = self._snap_to_point(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos, fast=False)
+        if p is None:
+            p = self._screen_to_world_fallback(event.pos)
+        if p is None:
+            return
+        if self._p1 is None:
+            self._p1 = p
+            c._p1_mk.set_data(pos=p[None, :], face_color=(0.2, 0.85, 1.0, 1.0), size=12)
+            c._p1_mk.visible = True
+            c.update()
+        else:
+            seg = np.array([self._p1, p], np.float32)
+            c._mline.set_data(seg, color=(0.2, 0.85, 1.0, 0.9))
+            c._mline.visible = True
+            c.update()
+            self._show_profile(self._p1, p)
+            self._p1 = None
+
+    def on_mouse_move(self, event):
+        c = self.canvas
+        if c is None or self._p1 is None:
+            return
+        p = self._snap_to_point(event.pos)
+        if p is None:
+            p = self._world_pos(event.pos)
+        if p is None:
+            p = self._screen_to_world_fallback(event.pos)
+        if p is None:
+            return
+        seg = np.array([self._p1, p], np.float32)
+        c._mline_live.set_data(seg, color=(1.0, 0.9, 0.2, 0.4))
+        c._mline_live.visible = True
+        c.update()
+
+    def on_key_press(self, event):
+        if getattr(event, "key", "") == "Escape":
+            self._p1 = None
+            self._clear_overlays()
+
+    def _show_profile(self, p1: np.ndarray, p2: np.ndarray) -> None:
+        from annotation.profile import extract_profile_slice
+        c = self.canvas
+        if c is None or c._cur_xyz is None or len(c._cur_xyz) == 0:
+            return
+        xyz = c._cur_xyz
+        gidx = c._cur_idx if (c._cur_idx is not None and len(c._cur_idx) == len(xyz)) else None
+
+        t, z, idx_out, length = extract_profile_slice(xyz, p1, p2, self.buffer_m, gidx)
+        colors, legend = self._colors_for(idx_out, z)
+
+        try:
+            from ui.profile_view import ProfileDialog
+            if self._dialog is None:
+                self._dialog = ProfileDialog(c.window() if hasattr(c, "window") else c)
+            self._dialog.update_data(t, z, colors, length, self.buffer_m, legend=legend)
+        except Exception:
+            import traceback; traceback.print_exc()
+
+    def _colors_for(self, idx_out: np.ndarray, z: np.ndarray):
+        """
+        Colorea el perfil por clasificación (modo anotación) si hay
+        proyecto/labels disponibles y `idx_out` son índices GLOBALES;
+        si no, cae a un degradado por altura — siempre se ve algo
+        coherente, nunca un scatter monocolor por defecto sin razón.
+        Devuelve (colors, legend) — legend es [(nombre, (r,g,b)), ...]
+        con solo las clases REALMENTE presentes en esta franja (no todo
+        el schema del proyecto), o [] si se cayó al degradado por altura.
+        """
+        c = self.canvas
+        try:
+            project = getattr(c, "project", None)
+            if project is not None and project.labels is not None and len(idx_out) > 0:
+                labels = project.labels[idx_out]
+                lut = {0: (130, 130, 130)}
+                names = {0: "sin etiquetar"}
+                for sc in project.schema:
+                    h = sc.color.lstrip("#")
+                    if len(h) >= 6:
+                        lut[sc.id] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+                        names[sc.id] = sc.name
+                out = np.empty((len(labels), 3), np.uint8)
+                for i, lb in enumerate(labels):
+                    out[i] = lut.get(int(lb), (90, 200, 230))
+                present = sorted(set(int(v) for v in labels))
+                legend = [(names.get(cid, f"clase {cid}"), lut.get(cid, (90, 200, 230)))
+                         for cid in present]
+                return out, legend
+        except Exception:
+            pass
+        # Fallback: degradado por altura (azul=bajo, rojo=alto)
+        if len(z) == 0:
+            return None, []
+        zmin, zmax = float(z.min()), float(z.max())
+        span = max(zmax - zmin, 1e-6)
+        f = np.clip((z - zmin) / span, 0.0, 1.0)
+        out = np.empty((len(z), 3), np.uint8)
+        out[:, 0] = (f * 255).astype(np.uint8)
+        out[:, 1] = 60
+        out[:, 2] = ((1 - f) * 255).astype(np.uint8)
+        return out, []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Import RegionGrowingTool / PlaneFitTool
+# (LabelMarkerTool vive arriba, en este mismo archivo — a diferencia de
+# RegionGrowingTool/PlaneFitTool, necesita cero dependencias nuevas de
+# annotation.markers, así que se evita el ciclo de imports que supondría
+# que annotation/markers.py importara BaseTool desde aquí.)
 from annotation.region_growing import RegionGrowingTool
+from annotation.plane_fit import PlaneFitTool
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Registro
@@ -1275,12 +1975,16 @@ TOOL_CLASSES = [
     BrushTool,
     DiscTool,
     RegionGrowingTool,
+    PlaneFitTool,
     PolygonTool,
     BoxSelectTool,
     SphereSelectTool,
     SliceTool,
     PickTool,
     MeasureTool,
+    LabelMarkerTool,
+    PolylineTool,
+    ProfileTool,
 ]
 
 TOOL_BY_KEY  = {t.key:  t for t in TOOL_CLASSES if t.key}

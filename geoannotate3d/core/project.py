@@ -161,6 +161,13 @@ class Project:
         self.labels:  Optional[np.ndarray] = None
         self.n_total: int                  = 0
 
+        # Marcadores persistentes (etiquetas de texto + medidas ancladas
+        # en 3D, ver annotation/markers.py::MarkerStore). Lista de dicts
+        # serializados (Marker.to_dict()) — el objeto MarkerStore en sí
+        # vive en la UI (AnnotationCanvas), no aquí; esto es solo el
+        # contenedor de persistencia, igual que self.labels con LabelStore.
+        self.markers: List[Dict] = []
+
     # ------------------------------------------------------------------
     # Construcción
     # ------------------------------------------------------------------
@@ -319,6 +326,10 @@ class Project:
         stats = meta.get("stats", {})
         p.n_total = int(stats.get("n_total", 0))
 
+        # Marcadores persistentes — lista vacía en proyectos antiguos que
+        # no la tenían (compatibilidad hacia atrás).
+        p.markers = meta.get("markers", [])
+
         return p
 
     # ------------------------------------------------------------------
@@ -445,6 +456,7 @@ class Project:
             "sensor_type":       self.sensor_type,
             "annotation_time_s": self.annotation_time_s,
             "schema":            [sc.to_dict() for sc in self.schema],
+            "markers":           self.markers,
             "stats": {
                 "n_labeled":        self.n_labeled,
                 "n_total":          self.n_total,

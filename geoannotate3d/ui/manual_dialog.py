@@ -39,7 +39,7 @@ MANUAL_SECTIONS = [
         "o usa Offset X/Y/Rotación para alinearla con la nube.",
     ]),
     ("magic", "Paso 2 — Pre-clasificar", [
-        "Dos métodos automáticos, independientes entre sí, para reducir "
+        "Métodos automáticos, independientes entre sí, para reducir "
         "el etiquetado manual:",
         "AGL (altura sobre el suelo): clasifica por rangos de altura "
         "relativa al punto más bajo de la nube. \"Configurar rangos…\" "
@@ -49,16 +49,39 @@ MANUAL_SECTIONS = [
         "CSF (Cloth Simulation Filter): el mismo algoritmo de detección "
         "de suelo que usa CloudCompare — simula una tela cayendo sobre "
         "la nube invertida.",
+        "SOR (Statistical Outlier Removal): mismo algoritmo de detección "
+        "de ruido que CloudCompare/PCL — marca puntos anormalmente "
+        "aislados de sus vecinos (ruido del sensor) y los ofrece para "
+        "eliminar (deshace con Ctrl+Z, igual que cualquier anotación).",
+        "QA de anotación (una vez ya etiquetaste algo): \"Suavizar "
+        "etiquetas\" recalcula la clase de cada punto etiquetado como la "
+        "mayoritaria entre sus vecinos, limpiando bordes ruidosos entre "
+        "clases — nunca toca puntos sin etiquetar ni eliminados. "
+        "\"Detectar clusters aislados\" busca, por clase, grupos "
+        "diminutos y aislados — candidatos a error de anotación (un "
+        "clic accidental) — sin cambiar nada por sí solo, solo reporta.",
     ]),
     ("tag", "Paso 3 — Etiquetar", [
         "Clases (panel izquierdo): cada clase es un círculo numerado y "
         "coloreado — teclas 1-9 o clic para activarla. Doble clic para "
         "renombrar/cambiar color.",
-        "Herramientas (panel derecho), cada una con su tecla: Pincel "
-        "(B, esférico, Ctrl+arrastra), Disco (D), Region Growing (G, "
-        "Ctrl+clic — crece por geometría conectada y similar), Polígono "
-        "(L), Caja (X), Esfera (H, Ctrl+clic instantáneo), Corte Z (C), "
-        "Pick (I, muestrea la clase de un punto), Medir (M).",
+        "Herramientas de selección (panel derecho), cada una con su "
+        "tecla: Pincel (B), Disco (D), Region Growing (G), Ajustar plano "
+        "(P, RANSAC — etiqueta solo lo plano dentro del radio), Polígono "
+        "(L), Caja (X), Esfera (H), Corte Z (C), Pick (I, muestrea la "
+        "clase de un punto). Todas se usan con Ctrl+clic o Ctrl+arrastrar.",
+        "Marcadores persistentes: Medir (M), Etiqueta 3D (N) y Polilínea "
+        "(K) no seleccionan puntos — dejan una marca anclada en 3D "
+        "(medida, texto, o trazo de varios vértices) que se guarda con "
+        "el proyecto. Ctrl+clic sobre una marca YA puesta la edita o "
+        "elimina (antes solo Etiqueta 3D podía editarse; ahora también "
+        "Medir y Polilínea). Perfil (O) traza una línea y abre el corte "
+        "vertical de esa franja en una ventana aparte, con leyenda por "
+        "clase y exportación a CSV.",
+        "Caja de recorte (sección Visualización): una caja 3D arrastrable "
+        "que aísla un volumen — oculta temporalmente lo de afuera, sin "
+        "borrar ni reclasificar nada; desactivarla restaura la vista "
+        "completa.",
         "E alterna modo borrar (quita la clase, el punto sigue en la "
         "nube). Supr alterna modo eliminar puntos (saca el punto de la "
         "nube — para limpiar ruido del sensor; funciona con cualquier "
@@ -73,6 +96,14 @@ MANUAL_SECTIONS = [
         "Marca \"Usar códigos ASPRS estándar\" al exportar el .las "
         "clasificado para que abra correctamente en CloudCompare/QGIS/"
         "ArcGIS con la clasificación estándar en vez de tus IDs internos.",
+        "Para ir construyendo un dataset MÁS GRANDE con varias nubes: "
+        "exporta cada nube apuntando a la MISMA carpeta de salida. "
+        "GeoAnnotate3D agrega los tiles nuevos en vez de pisar los de "
+        "exportaciones anteriores (cada tile lleva un identificador de su "
+        "nube de origen), y combina las estadísticas de dataset.json "
+        "(conteo por clase, pesos de clase, lista de tiles) de todas las "
+        "nubes exportadas ahí. Usa siempre el mismo proyecto/esquema de "
+        "clases para que los IDs signifiquen lo mismo en todas las nubes.",
     ]),
     ("cpu", "Paso 5 — Entrenar", [
         "Tres arquitecturas ya implementadas dentro de la app (RandLA-"
@@ -82,9 +113,24 @@ MANUAL_SECTIONS = [
         "Puedes reanudar un entrenamiento detenido desde cualquier "
         "checkpoint guardado (.pth) — restaura también el optimizador y "
         "el learning-rate scheduler, no solo los pesos.",
+        "Fine-tuning desde checkpoint externo: a diferencia de "
+        "\"Reanudar\" (mismo entrenamiento, mismas clases), esto empieza "
+        "un entrenamiento NUEVO reusando los pesos de OTRO checkpoint "
+        "como punto de partida — reusa capa por capa solo lo que calce "
+        "en forma, y reinicializa el resto (típicamente la capa de "
+        "clasificación final, si el número de clases cambió). Útil para "
+        "seguir aprendiendo sobre datos/clases nuevas a partir de un "
+        "modelo ya entrenado con esta misma app en otro proyecto.",
         "Al terminar, además del modelo verás un reporte por clase "
         "(precision/recall/IoU de cada clase por separado, no solo el "
         "mIoU agregado) — útil para saber qué clase necesita más datos.",
+        "\"Exportar a ONNX\" convierte un checkpoint ya entrenado a "
+        "formato ONNX, para correr inferencia fuera de esta app (otros "
+        "pipelines, dispositivos sin PyTorch, servidores de inferencia). "
+        "No depende de un entrenamiento en curso, solo de un .pth ya "
+        "guardado. RandLA-Net exporta con una salvedad: su submuestreo "
+        "aleatorio se vuelve fijo en el modelo exportado (PointNet++ y "
+        "KPConv no la tienen).",
     ]),
     ("bullseye", "Paso 6 — Inferir", [
         "Carga un modelo .pth entrenado y ejecuta inferencia sobre la "
@@ -112,6 +158,12 @@ MANUAL_SECTIONS = [
         "la siguiente vez que abras ESE MISMO archivo, detecta el "
         ".ga3d_bin existente y pregunta si usarlo. Es seguro borrarlo — "
         "se puede regenerar del original cuando haga falta.",
+        "Un archivo .laz en formato COPC (Cloud Optimized Point Cloud, "
+        "extensión .copc.laz) se detecta y se carga por una ruta "
+        "dedicada (su almacenamiento interno de puntos no es compatible "
+        "con el lector LAZ normal) — se muestra como \"COPC\" en la info "
+        "del archivo. Se carga todo de una vez; todavía no aprovecha su "
+        "índice espacial interno para cargar por partes.",
     ]),
 ]
 

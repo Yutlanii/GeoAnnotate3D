@@ -47,6 +47,11 @@ from annotation.tools import (ALL_TOOLS, TOOL_BY_NAME, TOOL_BY_KEY,
                                BrushTool, BaseTool)
 from render.canvas import AnnotationCanvas
 
+# Por encima de esta cantidad de puntos, "Densidad máx." (ver
+# _on_view_mode_requested) avisa antes de forzar la carga de TODOS los
+# puntos reales de la nube — puede congelar la app o consumir mucha RAM.
+FULL_DENSITY_WARN_THRESHOLD = 30_000_000
+
 
 # ── Header bar ────────────────────────────────────────────────────────────────
 
@@ -287,8 +292,7 @@ class _RailItem(QWidget):
         # no `border:none`) — cada hijo dibujaba su propio borde
         # heredado alrededor de su propio cuadro, dando el efecto de
         # "doble caja" reportado por el usuario. Mismo bug ya visto en
-        # `_ArchButton` (export_dialog.py) y `_StepCard`
-        # (welcome_dialog.py) — ver NOTES_CLAUDE.md.
+        # `_ArchButton` (export_dialog.py) y `_StepCard` (welcome_dialog.py).
         self.setObjectName("railItem")
 
         lay = QHBoxLayout(self)
@@ -407,20 +411,33 @@ class _OctreeBuilder(QThread):
     def run(self):
         try:
             from core.octree import Octree
-            import numpy as np
             xyz = self._pc.xyz
             if xyz is None or len(xyz) == 0:
                 self.ready.emit(None)
                 return
-            # Limitar a 150M puntos para el octree de overview
-            MAX_PTS = 150_000_000
-            if len(xyz) > MAX_PTS:
-                step = max(1, len(xyz) // MAX_PTS)
-                xyz_sub = np.ascontiguousarray(xyz[::step])
-            else:
-                xyz_sub = xyz
+            # BUG CORREGIDO (afectaba solo a nubes "heavy" >150M pts, cargadas
+            # vía .ga3d_bin o "cargar como normal" — ver _load_heavy_as_normal/
+            # _load_ga3d_bin más abajo): antes se pre-submuestreaba xyz con
+            # stride ANTES de construir el octree ("para no crashear la GPU"),
+            # pero Octree se queda con esa copia reducida como su _xyz_ref, así
+            # que TODOS los índices que devuelve (LOD, sphere query de Pincel/
+            # Esfera/Disco) apuntaban a posiciones dentro de esa copia, NO a
+            # pc.xyz real — el punto en el índice K del octree casi nunca era
+            # el punto K de la nube real. Consecuencia: en nubes >150M pts,
+            # el Pincel/Esfera/Disco pintaban/seleccionaban puntos
+            # equivocados (caveat conocido de una ronda anterior, sin
+            # corregir hasta ahora).
+            #
+            # Fix: construir el octree sobre xyz COMPLETO, sin pre-submuestrear
+            # — exactamente como ya hace CloudPipeline.run() (core/pointcloud.py)
+            # para el flujo normal de carga, que nunca tuvo este bug. El cap de
+            # 150M pts sigue existiendo, pero DENTRO de Octree.build() →
+            # _build_extended_lod(), que calcula cuánto cabe según la RAM
+            # disponible y jamás construye un nivel de LOD más grande de lo
+            # seguro — con la ventaja de que sus índices siempre son globales
+            # (índices reales dentro de pc.xyz), sin necesitar ningún mapeo.
             octree = Octree()
-            octree.build(xyz_sub)
+            octree.build(xyz)
             self.ready.emit(octree)
         except Exception as e:
             print(f"[OctreeBuilder] Error: {e}")
@@ -754,11 +771,19 @@ class MainWindow(QMainWindow):
         self._tool_panel.brush_overlap_changed.connect(self._on_brush_overlap_changed)
         self._tool_panel.brush_thickness_changed.connect(self._on_brush_thickness_changed)
         self._tool_panel.radius_changed.connect(self._on_radius_changed)
+        self._tool_panel.plane_radius_changed.connect(self._on_plane_radius_changed)
+        self._tool_panel.plane_threshold_changed.connect(self._on_plane_threshold_changed)
+        self._tool_panel.profile_buffer_changed.connect(self._on_profile_buffer_changed)
+        self._tool_panel.label_font_size_changed.connect(self._on_label_font_size_changed)
+        self._tool_panel.label_color_changed.connect(self._on_label_color_changed)
+        self._tool_panel.polyline_width_changed.connect(self._on_polyline_width_changed)
+        self._tool_panel.polyline_color_changed.connect(self._on_polyline_color_changed)
         self._tool_panel.lasso_close_requested.connect(self._on_lasso_close)
         self._tool_panel.point_size_changed.connect(self._canvas.set_point_size)
         self._tool_panel.grid_toggled.connect(self._canvas.toggle_grid)
         self._tool_panel.show_unlabeled_toggled.connect(self._on_show_unlabeled)
         self._tool_panel.edl_toggled.connect(self._canvas.set_edl_enabled)
+        self._tool_panel.clip_box_toggled.connect(self._canvas.toggle_clip_box)
         # v2.0: nuevas herramientas
         self._tool_panel.erase_mode_changed.connect(self._on_erase_mode_changed)
         self._tool_panel.delete_mode_changed.connect(self._on_delete_mode_changed)
@@ -780,6 +805,8 @@ class MainWindow(QMainWindow):
         self._geo_panel.agl_auto_classify_requested.connect(self._on_agl_auto_classify)
         self._geo_panel.csf_classify_requested.connect(self._on_csf_classify)
         self._geo_panel.sor_detect_requested.connect(self._on_sor_detect)
+        self._geo_panel.smooth_labels_requested.connect(self._on_smooth_labels)
+        self._geo_panel.isolated_clusters_requested.connect(self._on_isolated_clusters)
         self._geo_panel.agl_select_requested.connect(self._on_agl_select)
         self._geo_panel.rules_apply_all_requested.connect(self._on_rules_apply_all)
 
@@ -1093,6 +1120,9 @@ class MainWindow(QMainWindow):
             self._project.grid_offset_x = ox
             self._project.grid_offset_y = oy
             self._project.grid_rotation  = rot
+        # Marcadores persistentes (etiquetas/medidas 3D) — ver
+        # annotation/markers.py::MarkerStore.
+        self._project.markers = self._canvas.marker_store.to_list()
         self._project.stop_session()
         default_name = f"{self._project.name}.geoa3d"
         default_dir  = (str(Path(self._project.source_file).parent)
@@ -1211,6 +1241,9 @@ class MainWindow(QMainWindow):
         self._status.set_cloud(pc, self._project)
 
         self._canvas.load_cloud(pc, self._project)
+        # Restaurar marcadores persistentes (etiquetas/medidas 3D) del
+        # proyecto — vacío para un proyecto nuevo, ver Project.markers.
+        self._canvas.marker_store.load_list(self._project.markers)
 
         # Auto-select best initial color mode based on cloud data
         # (excluye DELETED_LABEL: puntos eliminados no cuentan como "hay
@@ -1326,8 +1359,122 @@ class MainWindow(QMainWindow):
         elif mode == "Sparse":
             self._canvas.set_overview_mode("sparse")
         elif mode == "Full":
-            self._canvas.set_overview_mode("full")
+            # "Densidad máx." — antes solo subía el cap RAM-safe del LOD
+            # (render.canvas.OVERVIEW_BUDGET_CAP / Octree._build_extended_lod),
+            # que en nubes grandes puede quedar por debajo de lo que ya se
+            # estaba viendo: el botón parecía no hacer nada. Ahora fuerza
+            # una fracción elegida por el usuario de los puntos reales de
+            # la nube completa (sin decimar por LOD). Un simple Sí/No de
+            # "carga TODO o nada" resultó insuficiente: un usuario con 32GB
+            # de RAM probó 450M pts al 100% y la app se cerró (probable
+            # límite de VRAM de la GPU, no de RAM — ver docstring de
+            # AnnotationCanvas.force_density). Ahora se puede elegir un
+            # punto intermedio en vez de todo-o-nada.
+            n = self._pc.n_points if self._pc is not None else 0
+            if n > FULL_DENSITY_WARN_THRESHOLD:
+                fraction = self._prompt_density_fraction(n)
+                if fraction is None:
+                    # Usuario canceló — dejar el botón como estaba
+                    self._tile_panel.set_view_mode(self._canvas.overview_mode)
+                    return
+            else:
+                fraction = 1.0
+            self._canvas.force_density(fraction)
         self._tile_panel.set_view_mode(mode)
+
+    def _prompt_density_fraction(self, n_points: int) -> Optional[float]:
+        """
+        Diálogo con slider para elegir qué porcentaje de los puntos reales
+        de la nube cargar en modo "Densidad máx.". Muestra una estimación
+        aproximada de RAM (no exacta: VTK/GPU duplican buffers y el uso
+        real depende del driver de la tarjeta gráfica) y compara contra la
+        RAM libre actual para sugerir un valor de partida razonable.
+        Devuelve la fracción (0.05–1.0) elegida, o None si el usuario
+        cancela.
+        """
+        from PyQt5.QtWidgets import QDialog, QSlider, QDialogButtonBox
+        from core.pointcloud import _available_ram_gb
+        from render.canvas import FORCE_DENSITY_HARD_CAP
+
+        BYTES_PER_PT_ESTIMATE = 40  # xyz f32 + color u8 + índice + margen VTK/GPU
+        try:
+            avail_gb = _available_ram_gb()
+        except Exception:
+            avail_gb = 8.0
+
+        # Sugerir un % que use como máximo ~50% de la RAM libre actual
+        safe_bytes = avail_gb * 0.50 * 1e9
+        suggested_pct = int(max(5, min(100,
+            round(safe_bytes / (n_points * BYTES_PER_PT_ESTIMATE) * 100 / 5) * 5)))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Densidad máxima")
+        dlg.setMinimumWidth(420)
+        dlg.setStyleSheet(
+            "QDialog{background:#e8e9eb;}"
+            "QLabel{color:#55585c;}")
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(10)
+
+        hdr = QLabel(
+            f"Esta nube tiene <b>{n_points/1e6:.0f} millones de puntos</b>.\n\n"
+            "Cargar el 100% muestra cada punto sin reducir la muestra, pero "
+            "puede consumir mucha memoria (RAM y/o VRAM de la GPU) y "
+            "congelar o cerrar la aplicación. Elige qué porcentaje mostrar:")
+        hdr.setWordWrap(True)
+        lay.addWidget(hdr)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(5, 100); slider.setSingleStep(5); slider.setPageStep(5)
+        slider.setValue(suggested_pct)
+        lay.addWidget(slider)
+
+        info_lbl = QLabel(); info_lbl.setWordWrap(True)
+        warn_lbl = QLabel(); warn_lbl.setWordWrap(True)
+        lay.addWidget(info_lbl); lay.addWidget(warn_lbl)
+
+        def _update(_val=None):
+            pct = slider.value()
+            requested_n = int(n_points * pct / 100)
+            # force_density() nunca sube más de FORCE_DENSITY_HARD_CAP puntos
+            # de golpe — un solo actor VTK con más que eso ya crasheó en la
+            # práctica (access violation nativo) incluso con RAM de sobra.
+            # Mostrar aquí lo que REALMENTE se va a cargar, no solo el % pedido.
+            target_n = min(requested_n, FORCE_DENSITY_HARD_CAP)
+            est_gb = target_n * BYTES_PER_PT_ESTIMATE / 1e9
+            capped_note = (f" (tope de seguridad: se muestran "
+                            f"{FORCE_DENSITY_HARD_CAP/1e6:.0f}M, no el "
+                            f"{pct}% completo)" if target_n < requested_n else "")
+            info_lbl.setText(
+                f"<b>{pct}%</b> → {target_n/1e6:.0f}M puntos ≈ "
+                f"{est_gb:.1f} GB estimados (RAM libre actual: {avail_gb:.0f} GB)"
+                f"{capped_note}")
+            if capped_note:
+                warn_lbl.setText(
+                    "ℹ Por seguridad nunca se cargan más de "
+                    f"{FORCE_DENSITY_HARD_CAP/1e6:.0f}M puntos de golpe: por "
+                    "encima de eso VTK puede crashear la app sin aviso, "
+                    "incluso con RAM libre de sobra.")
+                warn_lbl.setStyleSheet("color:#8a6d00;font-weight:600;")
+            elif est_gb > avail_gb * 0.70:
+                warn_lbl.setText(
+                    "⚠ Este valor probablemente supere tu RAM libre actual: "
+                    "riesgo alto de congelamiento o cierre.")
+                warn_lbl.setStyleSheet("color:#c0392b;font-weight:600;")
+            else:
+                warn_lbl.setText("Estimación dentro de un margen razonable de tu RAM libre.")
+                warn_lbl.setStyleSheet("color:#2e7d32;")
+        slider.valueChanged.connect(_update)
+        _update()
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(dlg.accept); box.rejected.connect(dlg.reject)
+        lay.addWidget(box)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return slider.value() / 100.0
 
     def _on_grid_edit_mode_changed(self, mode: str) -> None:
         """Feature 2: activar/desactivar modo de edición del grid con mouse."""
@@ -1535,6 +1682,41 @@ class MainWindow(QMainWindow):
         if isinstance(self._active_tool, SphereSelectTool):
             self._active_tool.radius_m = radius_m
 
+    def _on_plane_radius_changed(self, radius_m: float) -> None:
+        from annotation.plane_fit import PlaneFitTool
+        if isinstance(self._active_tool, PlaneFitTool):
+            self._active_tool.radius_m = radius_m
+
+    def _on_plane_threshold_changed(self, threshold_m: float) -> None:
+        from annotation.plane_fit import PlaneFitTool
+        if isinstance(self._active_tool, PlaneFitTool):
+            self._active_tool.distance_threshold_m = threshold_m
+
+    def _on_profile_buffer_changed(self, buffer_m: float) -> None:
+        from annotation.tools import ProfileTool
+        if isinstance(self._active_tool, ProfileTool):
+            self._active_tool.buffer_m = buffer_m
+
+    def _on_label_font_size_changed(self, font_size: float) -> None:
+        from annotation.tools import LabelMarkerTool
+        if isinstance(self._active_tool, LabelMarkerTool):
+            self._active_tool.font_size = font_size
+
+    def _on_label_color_changed(self, color: tuple) -> None:
+        from annotation.tools import LabelMarkerTool
+        if isinstance(self._active_tool, LabelMarkerTool):
+            self._active_tool.color = color
+
+    def _on_polyline_width_changed(self, width: float) -> None:
+        from annotation.tools import PolylineTool
+        if isinstance(self._active_tool, PolylineTool):
+            self._active_tool.line_width = width
+
+    def _on_polyline_color_changed(self, color: tuple) -> None:
+        from annotation.tools import PolylineTool
+        if isinstance(self._active_tool, PolylineTool):
+            self._active_tool.color = color
+
     def _on_lasso_close(self) -> None:
         from annotation.tools import PolygonTool
         if isinstance(self._active_tool, PolygonTool):
@@ -1556,9 +1738,9 @@ class MainWindow(QMainWindow):
     def _on_delete_mode_changed(self, v: bool) -> None:
         if self._active_tool: self._active_tool.delete_mode = v
         if v:
-            self._status.show_message(
+            self._status.showMessage(
                 "Modo eliminar puntos activo — los puntos seleccionados se "
-                "quitan de la nube (Ctrl+Z para deshacer)", timeout=3500)
+                "quitan de la nube (Ctrl+Z para deshacer)", 3500)
 
     def _on_only_unlabeled_changed(self, v: bool) -> None:
         if self._active_tool: self._active_tool.only_unlabeled = v
@@ -1609,7 +1791,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Reglas aplicadas",
             f"Se clasificaron {total:,} puntos con {len(rules)} regla(s).")
 
-    def _on_point_picked(self, utm_e: float, utm_n: float, utm_z: float) -> None:
+    def _on_point_picked(self, utm_e: float, utm_n: float, utm_z: float,
+                        picked_idx=None) -> None:
         if self._pc is None or self._project is None:
             return
         from utils.spatial import sphere_query
@@ -1617,11 +1800,27 @@ class MainWindow(QMainWindow):
         offset = self._pc.offset
         local  = np.array([utm_e - offset[0], utm_n - offset[1],
                            utm_z - offset[2]], np.float32)
-        idx    = sphere_query(self._pc.xyz, local, 0.05)
-        if len(idx) > 0 and self._project.labels is not None:
-            cid   = int(self._project.labels[idx[0]])
+
+        # `picked_idx` viene resuelto por PickTool (índice GLOBAL del punto
+        # real bajo el cursor, ver annotation/tools.py::_snap_to_point_idx) —
+        # es la vía CONFIABLE, porque `local` puede ser un promedio de varios
+        # puntos vecinos y no coincidir con ninguno real. Antes se buscaba
+        # SIEMPRE por coordenadas con sphere_query(radio=0.05m), lo que casi
+        # nunca encontraba nada y la clase salía "desconocido" aunque las
+        # coordenadas se vieran bien — se deja el sphere_query solo como
+        # respaldo si por algún motivo no llegó un índice ya resuelto.
+        idx0 = None
+        if picked_idx is not None:
+            idx0 = int(picked_idx)
+        else:
+            idx = sphere_query(self._pc.xyz, local, 0.05)
+            if len(idx) > 0:
+                idx0 = int(idx[0])
+
+        if idx0 is not None and self._project.labels is not None:
+            cid   = int(self._project.labels[idx0])
             sc    = next((s for s in self._project.schema if s.id == cid), None)
-            cname  = sc.name  if sc else f"clase {cid}"
+            cname  = sc.name  if sc else (f"clase {cid}" if cid > 0 else "sin etiquetar")
             ccolor = sc.color if sc else "#55585c"
         else:
             cname, ccolor = "desconocido", "#55585c"
@@ -1723,9 +1922,9 @@ class MainWindow(QMainWindow):
             else:
                 # Stack vacío — informar al usuario
                 if op_type == "undo":
-                    self._status.show_message("Nada que deshacer", timeout=1500)
+                    self._status.showMessage("Nada que deshacer", 1500)
                 else:
-                    self._status.show_message("Nada que rehacer", timeout=1500)
+                    self._status.showMessage("Nada que rehacer", 1500)
             return
 
         # Guardar
@@ -2157,6 +2356,99 @@ class MainWindow(QMainWindow):
             progress.close()
             QMessageBox.critical(self, "SOR Error", str(e))
 
+    def _on_smooth_labels(self, k: int) -> None:
+        """
+        Suavizado de etiquetas por mayoría de vecinos (ver
+        annotation/label_smoothing.py::smooth_labels_majority). Opera
+        sobre el tile activo si hay uno (más rápido, y suele ser lo que
+        se quiere revisar), o la nube completa si no. Usa
+        LabelStore.annotate_bulk (undo/redo con Ctrl+Z igual que cualquier
+        otra anotación).
+        """
+        if self._pc is None or self._project is None: return
+        from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+        from annotation.label_smoothing import smooth_labels_majority
+
+        progress = QProgressDialog("Suavizando etiquetas...", None, 0, 0, self)
+        progress.setWindowTitle("Suavizar etiquetas")
+        progress.setMinimumDuration(0); progress.setValue(0)
+        progress.setCancelButton(None)
+        QApplication.processEvents()
+        try:
+            restrict_idx = None
+            if self._canvas.is_tile_mode and getattr(self._canvas, '_tile_indices', None) is not None:
+                restrict_idx = self._canvas._tile_indices
+            changed_idx, new_labels = smooth_labels_majority(
+                self._pc.xyz, self._project.labels, k=k, restrict_idx=restrict_idx)
+            progress.close()
+            if len(changed_idx) == 0:
+                QMessageBox.information(self, "Suavizar etiquetas",
+                    "No hay nada que suavizar — las etiquetas ya son "
+                    "consistentes con sus vecinos (o no hay suficientes "
+                    "puntos etiquetados).")
+                return
+            reply = QMessageBox.question(
+                self, "Suavizar etiquetas",
+                f"Se reasignarían {len(changed_idx):,} puntos a la clase "
+                f"mayoritaria de sus vecinos.\n\n¿Aplicar? Se puede deshacer "
+                f"con Ctrl+Z.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                return
+            self._label_store.annotate_bulk(changed_idx, new_labels)
+            self._canvas.force_color_rebuild()
+            self._on_stats_changed()
+            QMessageBox.information(self, "Suavizado completado",
+                f"{len(changed_idx):,} puntos reasignados.")
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Suavizar etiquetas — Error", str(e))
+
+    def _on_isolated_clusters(self, max_cluster_size: int, connect_dist_m: float) -> None:
+        """
+        QA de anotación: reporta clusters pequeños/aislados por clase
+        (ver annotation/label_smoothing.py::detect_isolated_clusters_per_class).
+        Puro diagnóstico — no modifica nada; solo informa al usuario para
+        que revise a mano (o los pinte con Pincel/Esfera si son ruido).
+        """
+        if self._pc is None or self._project is None: return
+        from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+        from annotation.label_smoothing import detect_isolated_clusters_per_class
+
+        progress = QProgressDialog("Buscando clusters aislados...", None, 0, 0, self)
+        progress.setWindowTitle("Detectar clusters aislados")
+        progress.setMinimumDuration(0); progress.setValue(0)
+        progress.setCancelButton(None)
+        QApplication.processEvents()
+        try:
+            restrict_idx = None
+            if self._canvas.is_tile_mode and getattr(self._canvas, '_tile_indices', None) is not None:
+                restrict_idx = self._canvas._tile_indices
+            result = detect_isolated_clusters_per_class(
+                self._pc.xyz, self._project.labels,
+                max_cluster_size=max_cluster_size,
+                connect_dist_m=connect_dist_m, restrict_idx=restrict_idx)
+            progress.close()
+            if not result:
+                QMessageBox.information(self, "Clusters aislados",
+                    "No se encontraron clusters sospechosos con estos parámetros.")
+                return
+            name_of = {sc.id: sc.name for sc in self._project.schema}
+            lines = []
+            total = 0
+            for cid, clusters in sorted(result.items()):
+                cname = name_of.get(cid, str(cid))
+                n_pts = sum(sz for sz, _ in clusters)
+                total += n_pts
+                lines.append(f"  • {cname}: {len(clusters)} cluster(s), {n_pts} puntos")
+            QMessageBox.information(self, "Clusters aislados detectados",
+                f"Se encontraron clusters pequeños/aislados en {len(result)} clase(s) "
+                f"({total} puntos en total):\n\n" + "\n".join(lines) +
+                "\n\nRevísalos a mano (Pincel/Esfera) si parecen error de anotación.")
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Clusters aislados — Error", str(e))
+
     def _set_top_view(self) -> None:
         try:
             cam = self._canvas._ren.GetActiveCamera()
@@ -2308,6 +2600,26 @@ class MainWindow(QMainWindow):
 
         tbl.setRowCount(len(unique_cls))
         lay.addWidget(tbl)
+
+        # Botón masivo — antes había que poner "++ Crear clase nueva" fila
+        # por fila (hasta 21 veces en una nube como la de sample_data/) si
+        # se quería importar el esquema de clases de la nube tal cual, en
+        # vez de mapearlo a clases ya existentes del proyecto. Un clic
+        # pone TODAS las filas en "++ Crear clase nueva" de una vez — el
+        # usuario puede después re-ajustar a mano solo las que sí quiera
+        # mapear a una clase existente.
+        bulk_row = QHBoxLayout()
+        btn_all_new = QPushButton("Crear todas como clases nuevas")
+        btn_all_new.setStyleSheet(
+            "QPushButton{background:#e8e9eb;border:1px solid #0e7c86;border-radius:4px;"
+            "color:#0e7c86;padding:5px 12px;font-size:10.5px;font-weight:600;}"
+            "QPushButton:hover{background:#0e7c86;color:#ffffff;}")
+        last_idx = len(proj_opts) - 1   # posición de "++ Crear clase nueva"
+        btn_all_new.clicked.connect(
+            lambda: [cb.setCurrentIndex(last_idx) for _, cb in combos])
+        bulk_row.addWidget(btn_all_new)
+        bulk_row.addStretch()
+        lay.addLayout(bulk_row)
 
         chk = QCheckBox("Sobrescribir anotaciones existentes")
         chk.setStyleSheet("QCheckBox{color:#84888c;font-size:10.5px;}"

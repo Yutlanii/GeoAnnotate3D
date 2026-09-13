@@ -32,3 +32,6 @@ installer/
 # OS
 Thumbs.db
 .DS_Store
+
+# Notas internas de desarrollo - no publicar
+geoannotate3d/NOTES_CLAUDE.md

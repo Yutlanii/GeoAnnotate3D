@@ -24,7 +24,7 @@ Uso:
     worker.start()
 """
 from __future__ import annotations
-import json, textwrap
+import hashlib, json, re, textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -173,6 +173,28 @@ class ExportWorker(QThread):
     # Recolección de datos por tile
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Etiqueta de origen — para que exportar varias nubes distintas a la
+    # MISMA carpeta de salida (para ir agregando datos a un mismo dataset,
+    # en vez de sobrescribirlo) no genere nombres de tile colisionados.
+    # Antes cada tile se llamaba solo "tile_{col}_{row}" (o "tile_train" /
+    # "tile_val" / "tile_test" sin TileManager) — dos nubes distintas
+    # producen esos MISMOS nombres casi siempre (mismo esquema de tiles,
+    # o directamente los tres nombres fijos), así que la segunda
+    # exportación pisaba silenciosamente los .npy/.ply de la primera.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _source_tag(self) -> str:
+        """Prefijo corto y estable derivado del archivo de origen de la
+        nube actual: nombre de archivo saneado + hash corto de su ruta
+        completa (para que dos archivos con el mismo nombre en carpetas
+        distintas tampoco colisionen)."""
+        raw = str(getattr(self._pc, "path", None) or getattr(self._pc, "filename", None) or "cloud")
+        stem = Path(raw).stem or "cloud"
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem)[:40]
+        h = hashlib.md5(raw.encode("utf-8", "ignore")).hexdigest()[:6]
+        return f"{stem}_{h}"
+
     def _collect_tile_data(self) -> List[dict]:
         """
         Por cada tile anotado extrae:
@@ -185,6 +207,7 @@ class ExportWorker(QThread):
         pc     = self._pc
         labels = self._labels
         tiles  = []
+        tag    = self._source_tag()
 
         if self._tm is None:
             # Sin tile manager: dividir la nube en 3 segmentos espaciales (train/val/test)
@@ -205,9 +228,9 @@ class ExportWorker(QThread):
             n_val = max(1, int(n * self._config.val_ratio))
             n_tr  = min(n_tr,  n - 2)
             n_val = min(n_val, n - n_tr - 1)
-            tiles.append(self._build_tile_dict(idx[:n_tr],         "tile_train", np.array([0.0, 0.0])))
-            tiles.append(self._build_tile_dict(idx[n_tr:n_tr+n_val],"tile_val",  np.array([1.0, 0.0])))
-            tiles.append(self._build_tile_dict(idx[n_tr+n_val:],   "tile_test",  np.array([2.0, 0.0])))
+            tiles.append(self._build_tile_dict(idx[:n_tr],         f"{tag}_tile_train", np.array([0.0, 0.0])))
+            tiles.append(self._build_tile_dict(idx[n_tr:n_tr+n_val],f"{tag}_tile_val",  np.array([1.0, 0.0])))
+            tiles.append(self._build_tile_dict(idx[n_tr+n_val:],   f"{tag}_tile_test",  np.array([2.0, 0.0])))
             return tiles
 
         for tile in self._tm.tiles:
@@ -230,7 +253,7 @@ class ExportWorker(QThread):
                 (tile.min_xr + tile.max_xr) * 0.5,
                 (tile.min_yr + tile.max_yr) * 0.5,
             ], dtype=np.float64)
-            tile_id = f"tile_{tile.col}_{tile.row}"
+            tile_id = f"{tag}_tile_{tile.col}_{tile.row}"
             tiles.append(self._build_tile_dict(idx, tile_id, center))
 
         return tiles
@@ -320,10 +343,12 @@ class ExportWorker(QThread):
         )
 
     def _split_name(self, tile_id: str, split: SplitResult) -> str:
-        # Tiles generados por la ruta sin TileManager tienen nombre prefijado
-        if tile_id == "tile_train": return "train"
-        if tile_id == "tile_val":   return "val"
-        if tile_id == "tile_test":  return "test"
+        # Tiles generados por la ruta sin TileManager tienen nombre
+        # prefijado con el tag de origen, p.ej. "autzen_a1b2c3_tile_train"
+        # — basta con mirar el sufijo.
+        if tile_id.endswith("_tile_train"): return "train"
+        if tile_id.endswith("_tile_val"):   return "val"
+        if tile_id.endswith("_tile_test"):  return "test"
         if tile_id in split.train_tiles: return "train"
         if tile_id in split.val_tiles:   return "val"
         return "test"
@@ -747,6 +772,18 @@ class ExportWorker(QThread):
                 # PointNet++ espera (N, C) para puntos y (N,) para labels
                 return (torch.from_numpy(data).float(),
                         torch.from_numpy(labels).long())
+
+
+        def get_class_weights(data_dir, split='train'):
+            \"\"\"Calcula class_weights por frecuencia inversa para loss ponderado.\"\"\"
+            counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+            for f in glob.glob(os.path.join(data_dir, split, '*_labels.npy')):
+                lbl = np.load(f)
+                for c in range(NUM_CLASSES):
+                    counts[c] += int((lbl == c).sum())
+            counts = np.maximum(counts, 1)
+            weights = 1.0 / counts.astype(np.float64)
+            return torch.FloatTensor(weights / weights.sum() * NUM_CLASSES)
         """)
         (out / "custom_dataset.py").write_text(code, encoding="utf-8")
 
@@ -883,12 +920,22 @@ class ExportWorker(QThread):
             sname = self._split_name(t["tile_id"], split)
             tdir  = out / "data" / sname
 
-            # KPConv usa PLY con campos: x,y,z + scalar_label + RGB opcional
+            # KPConv usa PLY con: x,y,z + scalar_label + r,g,b + x_norm,y_norm,z_norm
+            # — mismas 9 columnas de feature que PointNet++ (ver
+            # _export_pointnetpp), en el mismo orden. Antes solo escribía
+            # x,y,z + rgb OPCIONAL (3 o 6 canales según si la nube tenía
+            # color real) mientras que el modelo KPConv (_build_kpconv,
+            # ui/training_panel.py) siempre espera 9 canales de entrada
+            # hardcodeados en su primera capa — con menos de 9 el
+            # entrenamiento crasheaba con
+            # "The size of tensor a (X) must match the size of tensor b (9)".
             self._write_ply(
                 tdir / f"{t['tile_id']}.ply",
                 t["xyz_local"],
                 t["labels"],
                 t["rgb"],
+                t["xy_norm"],
+                t["z_norm"],
             )
 
         self._write_kpconv_dataset_py(out, n_classes, class_names)
@@ -896,33 +943,37 @@ class ExportWorker(QThread):
         self._write_kpconv_readme(out, class_names)
         self._write_requirements(out, "kpconv")
 
-    def _write_ply(self, path: Path, xyz: np.ndarray,
-                   labels: np.ndarray, rgb: np.ndarray):
-        """Escribe un archivo PLY con xyz, scalar_label y RGB."""
+    def _write_ply(self, path: Path, xyz: np.ndarray, labels: np.ndarray,
+                   rgb: np.ndarray, xy_norm: np.ndarray, z_norm: np.ndarray):
+        """
+        Escribe un PLY binario con x,y,z + scalar_label + r,g,b +
+        x_norm,y_norm,z_norm — SIEMPRE las mismas 9 columnas de feature
+        (rgb es un array de ceros cuando la nube no trae color real, igual
+        que en PointNet++/RandLA-Net) para que el número de canales sea
+        constante sin importar la nube de origen — ver comentario en
+        _export_kpconv sobre por qué esto ya no es opcional.
+        """
         n = len(xyz)
-        has_rgb = rgb is not None and rgb.max() > 0
+        rgb_u8 = (rgb * 255).astype(np.uint8)
+        xy_norm = xy_norm.astype(np.float32)
+        z_norm  = z_norm.astype(np.float32)
         header  = (
             "ply\nformat binary_little_endian 1.0\n"
             f"element vertex {n}\n"
             "property float x\nproperty float y\nproperty float z\n"
             "property uchar scalar_label\n"
+            "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+            "property float x_norm\nproperty float y_norm\nproperty float z_norm\n"
+            "end_header\n"
         )
-        if has_rgb:
-            header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-        header += "end_header\n"
-
         with open(str(path), "wb") as f:
             f.write(header.encode("ascii"))
-            if has_rgb:
-                rgb_u8 = (rgb * 255).astype(np.uint8)
-                for i in range(n):
-                    f.write(xyz[i].astype(np.float32).tobytes())
-                    f.write(labels[i:i+1].astype(np.uint8).tobytes())
-                    f.write(rgb_u8[i].tobytes())
-            else:
-                for i in range(n):
-                    f.write(xyz[i].astype(np.float32).tobytes())
-                    f.write(labels[i:i+1].astype(np.uint8).tobytes())
+            for i in range(n):
+                f.write(xyz[i].astype(np.float32).tobytes())
+                f.write(labels[i:i+1].astype(np.uint8).tobytes())
+                f.write(rgb_u8[i].tobytes())
+                f.write(xy_norm[i].tobytes())
+                f.write(z_norm[i:i+1].tobytes())
 
     def _write_kpconv_dataset_py(self, out, n_classes, class_names):
         code = textwrap.dedent(f"""\
@@ -939,9 +990,16 @@ class ExportWorker(QThread):
 
         NUM_CLASSES  = {n_classes}
         CLASS_NAMES  = {class_names}
+        FEATURES     = 9   # x,y,z,r,g,b,x_norm,y_norm,z_norm — mismo orden que PointNet++
 
         def read_ply(path):
-            \"\"\"Lee un .ply binario exportado por GeoAnnotate3D.\"\"\"
+            \"\"\"
+            Lee un .ply binario exportado por GeoAnnotate3D: x,y,z +
+            scalar_label + r,g,b + x_norm,y_norm,z_norm — SIEMPRE estas 9
+            columnas de feature (r,g,b son 0 si la nube no tenía color
+            real), nunca menos — el modelo KPConv espera 9 canales de
+            entrada fijos en su primera capa.
+            \"\"\"
             with open(path, 'rb') as f:
                 lines = []
                 while True:
@@ -950,18 +1008,16 @@ class ExportWorker(QThread):
                     if line == 'end_header':
                         break
                 n = int(next(l.split()[-1] for l in lines if l.startswith('element vertex')))
-                has_rgb = any('red' in l for l in lines)
-                dtype = [('x','f4'),('y','f4'),('z','f4'),('label','u1')]
-                if has_rgb:
-                    dtype += [('red','u1'),('green','u1'),('blue','u1')]
+                dtype = [('x','f4'),('y','f4'),('z','f4'),('label','u1'),
+                         ('red','u1'),('green','u1'),('blue','u1'),
+                         ('x_norm','f4'),('y_norm','f4'),('z_norm','f4')]
                 data = np.frombuffer(f.read(n * np.dtype(dtype).itemsize), dtype=dtype)
 
             xyz    = np.stack([data['x'],data['y'],data['z']], axis=1).astype(np.float32)
             labels = data['label'].astype(np.int64)
-            rgb    = None
-            if has_rgb:
-                rgb = np.stack([data['red'],data['green'],data['blue']],1).astype(np.float32)/255
-            return xyz, labels, rgb
+            rgb    = np.stack([data['red'],data['green'],data['blue']],1).astype(np.float32)/255
+            norm   = np.stack([data['x_norm'],data['y_norm'],data['z_norm']],1).astype(np.float32)
+            return xyz, labels, rgb, norm
 
         class GeoAnnotateDataset(Dataset):
             def __init__(self, data_dir, split='train', num_points=8192, augment=True):
@@ -973,11 +1029,11 @@ class ExportWorker(QThread):
             def __len__(self): return len(self.files)
 
             def __getitem__(self, idx):
-                xyz, labels, rgb = read_ply(self.files[idx])
+                xyz, labels, rgb, norm = read_ply(self.files[idx])
                 n = len(xyz)
                 choice = (np.random.choice(n, self.num_points, replace=n < self.num_points))
                 xyz, labels = xyz[choice], labels[choice]
-                if rgb is not None: rgb = rgb[choice]
+                rgb, norm = rgb[choice], norm[choice]
 
                 if self.augment:
                     angle = np.random.uniform(0, 2*np.pi)
@@ -985,12 +1041,25 @@ class ExportWorker(QThread):
                     R = np.array([[c,-s,0],[s,c,0],[0,0,1]], np.float32)
                     xyz = xyz @ R.T
 
-                feats = xyz.copy()
-                if rgb is not None:
-                    feats = np.concatenate([xyz, rgb], axis=1)
+                feats = np.concatenate([xyz, rgb, norm], axis=1)   # (N, 9)
 
                 return (torch.from_numpy(feats).float(),
                         torch.from_numpy(labels).long())
+
+
+        def get_class_weights(data_dir, split='train'):
+            \"\"\"Calcula class_weights por frecuencia inversa para loss ponderado.
+            A diferencia de RandLA-Net/PointNet++ (labels en un .npy aparte),
+            acá las labels vienen embebidas en cada .ply — hay que leer el
+            archivo completo con read_ply() para contarlas.\"\"\"
+            counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+            for f in glob.glob(os.path.join(data_dir, split, '*.ply')):
+                _, labels, _, _ = read_ply(f)
+                for c in range(NUM_CLASSES):
+                    counts[c] += int((labels == c).sum())
+            counts = np.maximum(counts, 1)
+            weights = 1.0 / counts.astype(np.float64)
+            return torch.FloatTensor(weights / weights.sum() * NUM_CLASSES)
         """)
         (out / "custom_dataset.py").write_text(code, encoding="utf-8")
 
@@ -1097,7 +1166,12 @@ class ExportWorker(QThread):
         
         ## Formato PLY
         Cada tile es un archivo `.ply` binario little-endian con campos:
-        `x y z scalar_label [red green blue]`
+        `x y z scalar_label red green blue x_norm y_norm z_norm`
+        (siempre las 10 columnas — `red/green/blue` valen 0 si la nube no
+        tenía color real. `x_norm/y_norm/z_norm` son x,y,z normalizados al
+        rango del propio tile, en 0-1: junto con x,y,z,r,g,b arman las 9
+        columnas de feature que espera el modelo, el mismo orden que
+        PointNet++ — ver `custom_dataset.py::read_ply`.)
         """)
         (out / "README.md").write_text(md, encoding="utf-8")
 
@@ -1153,7 +1227,13 @@ class ExportWorker(QThread):
             if pc.intensity is not None:
                 las.intensity = (pc.intensity[keep] * 65535).astype(np.uint16)
             stem = Path(pc.filename).stem if pc.filename else "cloud"
-            las.write(str(out / f"{stem}_classified.las"))
+            # Se incluye siempre el tag de origen en el nombre: así
+            # re-exportar la MISMA nube pisa su propio .las anterior a
+            # propósito (mismo tag -> mismo nombre), y agregar una nube
+            # DISTINTA con el mismo nombre de archivo a la misma carpeta de
+            # dataset nunca pisa el .las de la anterior (tag distinto).
+            las_path = out / f"{stem}_{self._source_tag()}_classified.las"
+            las.write(str(las_path))
         except Exception as e:
             print(f"[export_las] {e}")
 
@@ -1169,8 +1249,66 @@ class ExportWorker(QThread):
             u, c = np.unique(real, return_counts=True)
             per_class = {str(int(k)): int(v) for k, v in zip(u, c)}
 
-        # Calcular class_weights
-        counts = {int(k): int(v) for k, v in per_class.items()}
+        schema_list = [s.to_dict() for s in schema]
+        source_file = self._project.source_file
+
+        # ── Fusionar con un dataset.json ya existente en esta carpeta ───────
+        # Permite ir agregando nubes distintas al MISMO dataset (exportar
+        # de nuevo, apuntando a la misma carpeta, en vez de crear una
+        # carpeta nueva cada vez): en lugar de pisar dataset.json entero
+        # (perdiendo el conteo/las tile_ids de exportaciones anteriores),
+        # se suman los tiles y conteos por clase con los ya guardados.
+        meta_path = out / "dataset.json"
+        prev = None
+        if meta_path.exists():
+            try:
+                with open(str(meta_path), "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+            except Exception as e:
+                print(f"[export] no se pudo leer dataset.json previo ({e}) — se sobrescribe.")
+                prev = None
+
+        schema_warning = None
+        if prev is not None and prev.get("schema") != schema_list:
+            schema_warning = (
+                "El esquema de clases de esta exportación no coincide "
+                "exactamente con el que ya estaba guardado en dataset.json "
+                "(¿un proyecto distinto, o clases añadidas/renombradas entre "
+                "exportaciones?). Se guardó el esquema de la exportación más "
+                "reciente, pero si los IDs de clase no significan lo mismo "
+                "en ambas nubes, los conteos y pesos combinados no son "
+                "fiables — revisa que todas las nubes que agregas a este "
+                "dataset usen el mismo proyecto/esquema de clases."
+            )
+            print(f"[export] AVISO: {schema_warning}")
+
+        if prev is not None:
+            n_tiles_total = int(prev.get("n_tiles_total", 0)) + len(tiles)
+            splits_prev   = prev.get("tile_ids", {"train": [], "val": [], "test": []})
+            tile_ids = {
+                "train": list(dict.fromkeys(splits_prev.get("train", []) + split.train_tiles)),
+                "val":   list(dict.fromkeys(splits_prev.get("val",   []) + split.val_tiles)),
+                "test":  list(dict.fromkeys(splits_prev.get("test",  []) + split.test_tiles)),
+            }
+            per_class_merged = {k: int(v) for k, v in prev.get("per_class_counts", {}).items()}
+            for k, v in per_class.items():
+                per_class_merged[k] = per_class_merged.get(k, 0) + v
+            source_files = list(prev.get("source_files") or (
+                [prev["source_file"]] if prev.get("source_file") else []))
+            if source_file and source_file not in source_files:
+                source_files.append(source_file)
+        else:
+            n_tiles_total = len(tiles)
+            tile_ids = {
+                "train": split.train_tiles,
+                "val":   split.val_tiles,
+                "test":  split.test_tiles,
+            }
+            per_class_merged = per_class
+            source_files = [source_file] if source_file else []
+
+        # Recalcular class_weights sobre los conteos YA combinados
+        counts = {int(k): int(v) for k, v in per_class_merged.items()}
         if counts:
             inv = {k: 1.0/v for k,v in counts.items()}
             s   = sum(inv.values())
@@ -1181,32 +1319,31 @@ class ExportWorker(QThread):
         meta = {
             "geoannotate3d_version": "10.0",
             "project_name":   self._project.name,
-            "source_file":    self._project.source_file,
+            "source_file":    source_file,
+            "source_files":   source_files,
             "crs":            self._project.crs,
             "offset_xyz":     self._project.offset_xyz,
             "architectures":  self._config.architectures,
             "split_strategy": self._config.split_strategy,
-            "n_tiles_total":  len(tiles),
+            "n_tiles_total":  n_tiles_total,
             "splits": {
-                "train": len(split.train_tiles),
-                "val":   len(split.val_tiles),
-                "test":  len(split.test_tiles),
+                "train": len(tile_ids["train"]),
+                "val":   len(tile_ids["val"]),
+                "test":  len(tile_ids["test"]),
             },
-            "tile_ids": {
-                "train": split.train_tiles,
-                "val":   split.val_tiles,
-                "test":  split.test_tiles,
-            },
-            "schema": [s.to_dict() for s in schema],
-            "per_class_counts": per_class,
+            "tile_ids": tile_ids,
+            "schema": schema_list,
+            "per_class_counts": per_class_merged,
             "class_weights": cw,
             "features": {
                 "randlanet":  ["x","y","z","intensity","r","g","b","x_norm","y_norm"],
                 "pointnetpp": ["x","y","z","r","g","b","x_norm","y_norm","z_norm"],
-                "kpconv":     ["x","y","z","r","g","b"],
+                "kpconv":     ["x","y","z","r","g","b","x_norm","y_norm","z_norm"],
             },
         }
-        with open(str(out / "dataset.json"), "w", encoding="utf-8") as f:
+        if schema_warning:
+            meta["schema_warning"] = schema_warning
+        with open(str(meta_path), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
 

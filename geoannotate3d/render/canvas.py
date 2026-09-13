@@ -55,6 +55,30 @@ BUDGET_FLOOR            = 20_000_000
 MAX_BUDGET              = 200_000_000
 OVERVIEW_BUDGET_CAP     = 10_000_000
 SPARSE_CAP              = 3_000_000    # budget fijo en modo sparse
+# Tope duro para force_density() (botón "Densidad máx." con % elegido por
+# el usuario) — confirmado en la práctica: 450M puntos en un solo actor
+# VTK causó un "Windows fatal exception: access violation" nativo (un
+# segfault dentro del driver de la GPU al hacer Render()), en una máquina
+# con 32GB de RAM libres de sobra — o sea, no es un problema de RAM, y no
+# es capturable con try/except porque ocurre fuera del intérprete de
+# Python. 150M es el mismo límite que core/octree.py ya usa como "nivel
+# más fino de LOD_TARGETS_EXT" (documentado ahí como suficiente para
+# llenar cualquier pantalla) — se reutiliza aquí como techo seguro
+# conocido, en vez de confiar en que cualquier fracción que el usuario
+# pida en el diálogo vaya a funcionar en su GPU.
+FORCE_DENSITY_HARD_CAP  = 150_000_000
+# FPS_LOW/FPS_HIGH siguen definiendo únicamente el TOTAL de puntos a
+# cargar (_budget) según el FPS medido en vivo (ver _fps_tick) — eso no
+# cambió. Lo que sí cambió (render/lod_worker.py + core/octree.py) es
+# CÓMO se elige cuáles puntos, dentro de ese presupuesto, mostrar: antes
+# siempre el mismo LOD plano en toda la nube por igual; ahora se aplica
+# frustum culling real (se descartan puntos fuera de cámara antes de
+# subirlos a GPU) y, si sigue sobrando presupuesto, se prioriza por
+# distancia a la cámara (Octree.iter_progressive_lod, vectorizado en
+# numpy/C — ver su docstring). Esto hace que el mismo _budget rinda
+# visualmente más (no se desperdicia en puntos fuera de cámara o muy
+# lejos), así que estos umbrales podrían poder bajarse con el tiempo sin
+# perder calidad percibida — pendiente de ajustar con FPS reales del usuario.
 FPS_LOW,  FPS_HIGH      = 8, 20
 # Tiles densos: por encima de este umbral, mostrar primero una vista previa
 # decimada (rápida de leer/subir a GPU) mientras el tile completo se carga
@@ -78,7 +102,16 @@ class CanvasSignals(QObject):
     fps               = pyqtSignal(float)
     render_info       = pyqtSignal(int, int)
     point_picked      = pyqtSignal(float, float, float)
-    point_picked_abs  = pyqtSignal(float, float, float)
+    # 4to argumento: índice GLOBAL (int) del punto real más cercano dentro
+    # de pc.xyz/project.labels, o None si no se pudo resolver (nube vacía o
+    # clic muy lejos de cualquier punto visible). Antes el Pick no mandaba
+    # este índice y quien escuchaba la señal tenía que volver a buscar el
+    # punto por coordenadas con un sphere_query de radio fijo — eso fallaba
+    # casi siempre porque la posición mostrada es un PROMEDIO de los K
+    # vecinos más cercanos en pantalla (ver BaseTool._world_pos), no la
+    # coordenada exacta de ningún punto real, así que la clasificación
+    # salía siempre "desconocido" aunque las coordenadas se vieran bien.
+    point_picked_abs  = pyqtSignal(float, float, float, object)
     measure_segment   = pyqtSignal(float, float, float)
     cursor_utm        = pyqtSignal(float, float, float)
     tile_mode_changed = pyqtSignal(bool, object)   # (en_tile_mode, TileInfo|None)
@@ -376,6 +409,241 @@ class _MarkersProxy:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Caja de recorte interactiva (clip box)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ClipBoxController:
+    """
+    Caja de recorte interactiva estilo CloudCompare/Potree: un
+    `vtkBoxWidget` (widget nativo de VTK, ya probado — no un mecanismo
+    propio) cuyos 6 planos se aplican directamente como clipping planes
+    del mapper de la nube. Es puramente visual/no-destructivo: no
+    modifica ni un solo punto de los datos, solo qué se dibuja — apagar
+    la caja (`disable()`) devuelve el render exactamente a como estaba.
+
+    RotationEnabledOff(): caja alineada a ejes únicamente (mover/escalar
+    caras, sin rotar) — más simple y predecible para "aislar un volumen"
+    que un recorte oblicuo, mismo espíritu que la caja de CloudCompare.
+    """
+    def __init__(self, renderer, interactor):
+        self._ren = renderer
+        self._iren = interactor
+        self._widget: Optional["vtk.vtkBoxWidget"] = None
+        self._mapper = None
+        self.enabled: bool = False
+
+    def _ensure_widget(self):
+        if self._widget is not None:
+            return self._widget
+        bw = vtk.vtkBoxWidget()
+        bw.SetInteractor(self._iren)
+        bw.SetPlaceFactor(1.0)
+        bw.RotationEnabledOff()
+        bw.GetOutlineProperty().SetColor(0.9, 0.6, 0.1)
+        bw.GetOutlineProperty().SetLineWidth(2.0)
+        bw.GetSelectedOutlineProperty().SetColor(1.0, 0.8, 0.2)
+        bw.AddObserver("InteractionEvent", self._on_interaction)
+        self._widget = bw
+        return bw
+
+    def enable(self, mapper, bounds) -> None:
+        self._mapper = mapper
+        bw = self._ensure_widget()
+        bw.PlaceWidget(*bounds)
+        bw.On()
+        self.enabled = True
+        self._apply_planes()
+
+    def disable(self) -> None:
+        if self._widget is not None:
+            self._widget.Off()
+        if self._mapper is not None:
+            try:
+                self._mapper.RemoveAllClippingPlanes()
+            except Exception:
+                pass
+        self.enabled = False
+
+    def _on_interaction(self, obj, event) -> None:
+        self._apply_planes()
+
+    def _apply_planes(self) -> None:
+        """
+        BUG REAL ENCONTRADO Y CORREGIDO (2026-09-09): `vtkBoxWidget.GetPlanes()`
+        devuelve las 6 caras con la normal apuntando hacia AFUERA de la caja
+        (confirmado con un render offscreen real — algo que no sabía que
+        podía hacer en este entorno hasta ahora: `vtkRenderWindow` con
+        `SetOffScreenRendering(1)`, SIN Qt/interactor, SÍ renderiza aquí,
+        a diferencia de `QVTKRenderWindowInteractor`). Pero
+        `mapper.AddClippingPlane` conserva el lado donde la función del
+        plano es POSITIVA — que con la normal apuntando hacia afuera es
+        precisamente el lado de AFUERA. Aplicar los 6 planos tal cual
+        devuelve VTK exige simultáneamente "afuera de cada una de las 6
+        caras" — una intersección vacía para cualquier caja bien formada
+        (las caras opuestas de un mismo eje se contradicen entre sí) — el
+        resultado real, verificado con una imagen renderizada, era
+        SIEMPRE una pantalla negra (nada visible), no un recorte parcial.
+        Fix: invertir cada normal (mismo origen, `-normal`) antes de
+        aplicarla — así el lado conservado pasa a ser el de ADENTRO de la
+        caja en las 6 caras a la vez, que es lo que se quiere ("solo se ve
+        lo que está dentro", igual que en CloudCompare/Cyclone 3DR).
+        Verificado con un render offscreen real antes/después del fix.
+        """
+        if self._widget is None or self._mapper is None:
+            return
+        try:
+            planes = vtk.vtkPlanes()
+            self._widget.GetPlanes(planes)
+            self._mapper.RemoveAllClippingPlanes()
+            for i in range(planes.GetNumberOfPlanes()):
+                src = planes.GetPlane(i)
+                nx, ny, nz = src.GetNormal()
+                ox, oy, oz = src.GetOrigin()
+                inward = vtk.vtkPlane()
+                inward.SetOrigin(ox, oy, oz)
+                inward.SetNormal(-nx, -ny, -nz)
+                self._mapper.AddClippingPlane(inward)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Marcadores persistentes (etiquetas de texto + medidas ancladas en 3D)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _MarkerOverlay:
+    """
+    Sincroniza actores VTK con annotation.markers.MarkerStore — se
+    reconstruye por completo en cada markers_changed (la cantidad de
+    marcadores es siempre pequeña, decenas como mucho, así que
+    reconstruir es más simple y seguro que un diff incremental).
+
+    Por marcador: una esfera pequeña en la posición, un texto (ver más
+    abajo), y — solo para medidas/polilíneas — una línea entre los
+    puntos.
+
+    HISTORIA DEL TEXTO (dos intentos previos, ambos descartados):
+      1. `vtkBillboardTextActor3D` en el mismo renderer que la nube —
+         depth-tested normal, la nube lo tapaba (el bug original).
+      2. Una capa VTK separada (`renderer.SetLayer(1)`) — un test de
+         píxeles reales demostró que VTK conserva el depth buffer entre
+         capas, así que tampoco lo arreglaba.
+      3. Un QWidget de Qt superpuesto ENCIMA del widget nativo de VTK —
+         rompió el render por completo (la nube dejó de verse y la app
+         se colgaba al recargar una nube) — mezclar un widget Qt
+         translúcido con la ventana nativa de OpenGL que usa
+         QVTKRenderWindowInteractor NO es seguro en general.
+      4. (la que se quedó, ver abajo) `vtkTextActor` — un actor 2D
+         (`vtkActor2D`), no 3D — con su `PositionCoordinate` puesto en
+         el sistema `World`: VTK reproyecta su posición 3D a pantalla
+         automáticamente en cada render (usando la cámara activa, sin
+         código Python de por medio) y los actores 2D SIEMPRE se
+         componen sin test de profundidad contra la geometría 3D — es
+         el mecanismo real y soportado de VTK para "texto anclado en el
+         mundo pero siempre visible", verificado con un render offscreen
+         real (un plano opaco justo delante del texto en el eje Z, el
+         texto se ve de todas formas).
+    """
+    def __init__(self, renderer):
+        self._ren = renderer
+        self._actors: list = []
+
+    def sync(self, markers) -> None:
+        self.clear()
+        for m in markers:
+            self._add_marker_actors(m)
+
+    def clear(self) -> None:
+        for a in self._actors:
+            try:
+                self._ren.RemoveActor(a)
+            except Exception:
+                pass
+        self._actors = []
+
+    def _add_marker_actors(self, m) -> None:
+        try:
+            color = tuple(float(v) for v in m.color[:3]) if len(m.color) >= 3 else (1.0, 0.85, 0.2)
+            pos = (float(m.pos[0]), float(m.pos[1]), float(m.pos[2]))
+
+            sphere = vtk.vtkSphereSource()
+            sphere.SetRadius(0.15); sphere.SetThetaResolution(10); sphere.SetPhiResolution(10)
+            mapper = vtk.vtkPolyDataMapper(); mapper.SetInputConnection(sphere.GetOutputPort())
+            actor = vtk.vtkActor(); actor.SetMapper(mapper)
+            actor.SetPosition(*pos)
+            actor.GetProperty().SetColor(*color)
+            actor.GetProperty().LightingOff()
+            self._ren.AddActor(actor); self._actors.append(actor)
+
+            label = m.text
+            if label:
+                txt = vtk.vtkTextActor()
+                txt.SetInput(label)
+                # Coordenadas de MUNDO — VTK recalcula la posición en
+                # pantalla solo, cada render, con la cámara activa;
+                # ver el porqué en el docstring de la clase.
+                txt.GetPositionCoordinate().SetCoordinateSystemToWorld()
+                txt.GetPositionCoordinate().SetValue(*pos)
+                tp = txt.GetTextProperty()
+                tp.SetColor(*color); tp.SetFontSize(int(getattr(m, "font_size", 14) or 14))
+                tp.SetBold(True); tp.SetShadow(True)
+                self._ren.AddActor2D(txt); self._actors.append(txt)
+
+            if m.kind == "measure" and m.pos_b is not None:
+                pos_b = (float(m.pos_b[0]), float(m.pos_b[1]), float(m.pos_b[2]))
+                line_poly = vtk.vtkPolyData()
+                pts = vtk.vtkPoints()
+                pts.InsertNextPoint(*pos); pts.InsertNextPoint(*pos_b)
+                line_poly.SetPoints(pts)
+                line = vtk.vtkLine()
+                line.GetPointIds().SetId(0, 0); line.GetPointIds().SetId(1, 1)
+                cells = vtk.vtkCellArray(); cells.InsertNextCell(line)
+                line_poly.SetLines(cells)
+                lmapper = vtk.vtkPolyDataMapper(); lmapper.SetInputData(line_poly)
+                lactor = vtk.vtkActor(); lactor.SetMapper(lmapper)
+                lactor.GetProperty().SetColor(*color)
+                lactor.GetProperty().SetLineWidth(float(getattr(m, "line_width", 2.0) or 2.0))
+                lactor.GetProperty().LightingOff()
+                self._ren.AddActor(lactor); self._actors.append(lactor)
+
+            if m.kind == "polyline" and m.points and len(m.points) >= 2:
+                # Una polilínea abierta de N vértices — a diferencia de
+                # "measure" (siempre 2 puntos), aquí se conecta cada
+                # vértice con el siguiente en una sola vtkPolyLine, y se
+                # dibuja una esferita en CADA vértice (no solo el primero)
+                # para que se distingan los quiebres de la línea.
+                n_pts = len(m.points)
+                vtk_pts = vtk.vtkPoints()
+                for pt in m.points:
+                    vtk_pts.InsertNextPoint(float(pt[0]), float(pt[1]), float(pt[2]))
+                poly_line = vtk.vtkPolyLine()
+                poly_line.GetPointIds().SetNumberOfIds(n_pts)
+                for i in range(n_pts):
+                    poly_line.GetPointIds().SetId(i, i)
+                cells = vtk.vtkCellArray(); cells.InsertNextCell(poly_line)
+                line_poly = vtk.vtkPolyData()
+                line_poly.SetPoints(vtk_pts); line_poly.SetLines(cells)
+                lmapper = vtk.vtkPolyDataMapper(); lmapper.SetInputData(line_poly)
+                lactor = vtk.vtkActor(); lactor.SetMapper(lmapper)
+                lactor.GetProperty().SetColor(*color)
+                lactor.GetProperty().SetLineWidth(float(getattr(m, "line_width", 2.5) or 2.5))
+                lactor.GetProperty().LightingOff()
+                self._ren.AddActor(lactor); self._actors.append(lactor)
+                for pt in m.points[1:]:   # el primero ya tiene su esfera arriba
+                    vsphere = vtk.vtkSphereSource()
+                    vsphere.SetRadius(0.12); vsphere.SetThetaResolution(8); vsphere.SetPhiResolution(8)
+                    vmapper = vtk.vtkPolyDataMapper(); vmapper.SetInputConnection(vsphere.GetOutputPort())
+                    vactor = vtk.vtkActor(); vactor.SetMapper(vmapper)
+                    vactor.SetPosition(float(pt[0]), float(pt[1]), float(pt[2]))
+                    vactor.GetProperty().SetColor(*color)
+                    vactor.GetProperty().LightingOff()
+                    self._ren.AddActor(vactor); self._actors.append(vactor)
+        except Exception:
+            import traceback; traceback.print_exc()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Estilo de interacción
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -468,10 +736,10 @@ class _AnnotationStyle(vtk.vtkInteractorStyleTrackballCamera):
                     canvas._update_tile_hover(pos)
                 except AttributeError:
                     pass
-            # Cursor de radio para Esfera y Pincel sin necesidad de Ctrl
+            # Cursor de radio para Esfera, Pincel y Ajustar Plano sin necesidad de Ctrl
             if (canvas.active_tool is not None and
                     canvas.active_tool.__class__.__name__
-                    in ("SphereSelectTool", "BrushTool")):
+                    in ("SphereSelectTool", "BrushTool", "PlaneFitTool")):
                 canvas._cursor_tick = (canvas._cursor_tick + 1) % _CURSOR_THROTTLE
                 if canvas._cursor_tick == 0:
                     canvas._update_brush_cursor(pos)
@@ -653,9 +921,25 @@ class AnnotationCanvas(QWidget):
         self._tile_manager = None
         self._hover_tile   = None
         self._tile_grid    = _TileGridOverlay(self._ren_overlay)
+        # Preferencia del usuario para el toggle "Grilla de fondo" del tool
+        # panel (ver toggle_grid/_apply_grid_visibility) — antes toggle_grid
+        # era un no-op (`pass`) y la visibilidad real la decidía solo
+        # set_tile_manager/exit_tile_mode, ignorando el checkbox por completo.
+        # Default False: coincide con el valor inicial del toggle en
+        # ui/tool_panel.py (fila "Grilla de fondo").
+        self._grid_user_visible = False
         # Sincronizar cámara del overlay con la cámara principal
         # (se actualiza automáticamente en cada render porque comparten el mismo objeto)
         self._ren_overlay.SetActiveCamera(self._ren.GetActiveCamera())
+
+        # ── Caja de recorte interactiva (clip box) ────────────────────────────
+        self._clip_box = _ClipBoxController(self._ren, self._vtkw.GetRenderWindow().GetInteractor())
+
+        # ── Marcadores persistentes (etiquetas/medidas 3D) ────────────────────
+        from annotation.markers import MarkerStore
+        self.marker_store   = MarkerStore()
+        self._marker_overlay = _MarkerOverlay(self._ren)
+        self.marker_store.markers_changed.connect(self._on_markers_changed)
 
         # ── Grid edit mode (Mover / Rotar con mouse) ──────────────────────────
         self._grid_edit_mode: Optional[str] = None   # "move" | "rotate" | None
@@ -779,6 +1063,11 @@ class AnnotationCanvas(QWidget):
 
     def load_cloud(self, pc, project):
         self._worker.cancel()
+        # La caja de recorte queda referida a la nube ANTERIOR — sus bounds
+        # ya no tienen sentido para la nueva. Apagarla es lo seguro (el
+        # usuario puede reactivarla, que recalcula bounds sobre lo nuevo).
+        if getattr(self, '_clip_box', None) is not None and self._clip_box.enabled:
+            self._clip_box.disable()
         self.pc = pc; self.project = project
         from render.colors import build_annotation_lut, build_annotation_lut_u8
         self._annotation_lut    = build_annotation_lut(project.schema)
@@ -834,6 +1123,63 @@ class AnnotationCanvas(QWidget):
 
         self.sig.view_mode_changed.emit(mode)
 
+    def force_density(self, fraction: float = 1.0) -> None:
+        """
+        Sube una fracción arbitraria (0 < fraction <= 1.0) de los puntos
+        REALES de la nube completa, ignorando el cap RAM-safe que
+        Octree._build_extended_lod() aplica al construir niveles de LOD
+        (ese cap podía quedar por debajo, o muy cerca, de lo ya visible en
+        nubes grandes, haciendo que "Densidad máx." pareciera no hacer
+        nada). fraction=1.0 sube TODOS los puntos sin decimar en absoluto.
+
+        fraction<1.0 usa un muestreo por paso fijo (arange con stride) en
+        vez de un subconjunto de la nube ya decimado por LOD — barato en
+        memoria (un solo array nuevo de tamaño target_n, no una copia de
+        n) y aproximadamente uniforme si los puntos no vienen ya
+        agrupados espacialmente en el archivo de origen.
+
+        Llamar solo tras advertir al usuario del riesgo real (ver
+        MainWindow._prompt_density_fraction /
+        _on_view_mode_requested): incluso con fraction=1.0 en una máquina
+        con RAM de sobra, puede fallar por falta de VRAM en la GPU (que es
+        un recurso aparte, normalmente mucho más chico que la RAM del
+        sistema) o por los picos de memoria transitorios de VTK al subir
+        el buffer — no solo por RAM insuficiente. Por eso target_n nunca
+        supera FORCE_DENSITY_HARD_CAP pase lo que pase (ver esa constante):
+        un access violation nativo de VTK no es recuperable ni con
+        try/except, así que aquí se prioriza no crashear sobre respetar
+        al pie de la letra el % pedido.
+        """
+        pc = self.pc
+        if pc is None or self._tile_mode:
+            return
+        fraction = max(1e-6, min(1.0, fraction))
+        self._worker.cancel()
+        self._overview_mode = "full"
+        n = pc.n_points
+        target_n = min(max(1, int(n * fraction)), FORCE_DENSITY_HARD_CAP)
+        if target_n >= n:
+            idx = np.arange(n)
+        else:
+            step = max(1, n // target_n)
+            idx = np.arange(0, n, step, dtype=np.int64)
+        xyz_sub = pc.xyz[idx] if target_n < n else pc.xyz
+        from render.colors import compute_colors_u8
+        lbl = (self.project.labels[idx]
+               if self.project and self.project.labels is not None else None)
+        col_u8 = compute_colors_u8(xyz_sub, pc.get_attrs(idx), self._color_mode, self._cmap,
+                                   annotation_labels=lbl,
+                                   annotation_lut_u8=self._annotation_lut_u8)
+        self._cur_xyz = xyz_sub; self._cur_idx = idx
+        self._budget  = len(idx)
+        self._ensure_gpu_buffer(len(idx))
+        self._gpu_upload_zero_copy(xyz_sub, col_u8)
+        self._render_state = "DONE"
+        self._done_ticks = 0
+        self._do_render()
+        self.sig.render_info.emit(len(idx), n)
+        self.sig.view_mode_changed.emit("full")
+
     def _upload_coarse_at(self, target_pts: int) -> None:
         """Muestra una vista LOD con exactamente target_pts puntos."""
         pc = self.pc
@@ -859,9 +1205,20 @@ class AnnotationCanvas(QWidget):
         self._tile_manager = tm
         self._hover_tile   = None
         self._grid_drag_active = False
-        show_grid = (tm is not None) and not self._tile_mode
+        show_grid = (tm is not None) and not self._tile_mode and self._grid_user_visible
         self._tile_grid.set_tile_manager(tm, show=show_grid)
         self._do_render()
+
+    def _apply_grid_visibility(self) -> None:
+        """
+        Aplica la visibilidad efectiva del grid overlay de tiles: la
+        preferencia del usuario (checkbox "Grilla de fondo", ver
+        toggle_grid) Y que haya un TileManager Y que no estemos dentro de
+        un tile individual (ahí el grid de límites de tile no aplica).
+        """
+        show = bool(self._grid_user_visible and self._tile_manager is not None
+                    and not self._tile_mode)
+        self._tile_grid.set_visible(show)
 
     # ── Grid edit mode (Mover / Rotar con mouse) ──────────────────────────────
 
@@ -1049,9 +1406,10 @@ class AnnotationCanvas(QWidget):
         self._tile_indices = None
         self._render_state = "IDLE"
 
-        # Restaurar grid overlay
+        # Restaurar grid overlay (respetando la preferencia del usuario,
+        # no forzando visible=True siempre — ver _apply_grid_visibility)
         self._tile_grid.update_active(None)
-        self._tile_grid.set_visible(True)
+        self._apply_grid_visibility()
 
         # Restaurar budget según modo overview
         if self._overview_mode == "sparse":
@@ -1260,7 +1618,17 @@ class AnnotationCanvas(QWidget):
         self._render_state = "IDLE"; self._req_worker()
 
     def set_budget_auto(self, v): self._budget_auto = v
-    def toggle_grid(self, show): pass
+
+    def toggle_grid(self, show) -> None:
+        """
+        Checkbox "Grilla de fondo" del tool panel — antes era un no-op
+        (`pass`), así que activar/desactivar el checkbox no tenía ningún
+        efecto visible: la visibilidad real del grid de límites de tile la
+        decidían solo set_tile_manager()/exit_tile_mode(), sin mirar nunca
+        esta preferencia. Ahora sí se guarda y se aplica de inmediato.
+        """
+        self._grid_user_visible = bool(show)
+        self._apply_grid_visibility()
 
     # ── Eye-Dome Lighting ─────────────────────────────────────────────────────
     # Sombreado por profundidad (sin necesitar normales) que hace mucho más
@@ -1284,6 +1652,55 @@ class AnnotationCanvas(QWidget):
             self._do_render()
         except Exception as e:
             print(f"[EDL] No se pudo {'activar' if enabled else 'desactivar'}: {e}")
+
+    # ── Caja de recorte interactiva ───────────────────────────────────────────
+
+    def toggle_clip_box(self, enabled: bool) -> None:
+        """
+        Activa/desactiva la caja de recorte 3D interactiva (estilo
+        CloudCompare/Potree) — ver _ClipBoxController. Puramente visual:
+        no modifica los datos, solo qué se dibuja. Arrastra las caras de
+        la caja naranja para aislar un volumen; desactivar restaura la
+        vista completa.
+        """
+        if self._vtk_mapper is None:
+            return
+        try:
+            if enabled:
+                bounds = self._clip_box_bounds()
+                self._clip_box.enable(self._vtk_mapper, bounds)
+            else:
+                self._clip_box.disable()
+            self._do_render()
+        except Exception as e:
+            print(f"[ClipBox] No se pudo {'activar' if enabled else 'desactivar'}: {e}")
+
+    def _clip_box_bounds(self):
+        """Bounds iniciales de la caja: la nube/tile actualmente visible,
+        con un margen del 5% — así arranca envolviendo todo (sin recortar
+        nada) hasta que el usuario arrastre una cara hacia adentro."""
+        try:
+            xyz = self._cur_xyz if self._cur_xyz is not None else (
+                self.pc.xyz if self.pc is not None else None)
+            if xyz is not None and len(xyz) > 0:
+                sample = xyz if len(xyz) <= 2_000_000 else xyz[::max(1, len(xyz)//2_000_000)]
+                mn = sample.min(0); mx = sample.max(0)
+                pad = float(max((mx - mn).max(), 1.0)) * 0.05
+                return (float(mn[0]-pad), float(mx[0]+pad),
+                        float(mn[1]-pad), float(mx[1]+pad),
+                        float(mn[2]-pad), float(mx[2]+pad))
+        except Exception:
+            pass
+        return (-10.0, 10.0, -10.0, 10.0, -10.0, 10.0)
+
+    # ── Marcadores persistentes ───────────────────────────────────────────────
+
+    def _on_markers_changed(self) -> None:
+        try:
+            self._marker_overlay.sync(self.marker_store.all())
+            self._do_render()
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def clamp_camera_to_cloud(self) -> None:
         """
@@ -1889,7 +2306,8 @@ class AnnotationCanvas(QWidget):
 
     def _update_brush_cursor(self, screen_pos):
         if (self.active_tool is None or
-                self.active_tool.__class__.__name__ not in ("BrushTool","RadiusTool","SphereSelectTool")):
+                self.active_tool.__class__.__name__
+                not in ("BrushTool", "RadiusTool", "SphereSelectTool", "PlaneFitTool")):
             self._hide_brush_cursor(); return
         if self._cur_xyz is None or len(self._cur_xyz) == 0: return
         try:

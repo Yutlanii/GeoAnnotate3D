@@ -24,10 +24,10 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QSlider, QPushButton, QFrame, QComboBox,
     QSizePolicy, QGridLayout, QDoubleSpinBox,
-    QSpinBox, QCheckBox,
+    QSpinBox, QCheckBox, QScrollArea,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QFont, QFontMetrics
 
 from annotation.tools import ALL_TOOLS
 from ui.icons import pixmap as qpixmap, icon as qicon
@@ -131,6 +131,7 @@ _TOOL_ICON = {
     "Pincel":         "brush",
     "Disco":          "record-circle",
     "Region Growing": "share",
+    "Ajustar plano":  "bricks",
     "Polígono":       "pentagon",
     "Caja":           "bounding-box",
     "Esfera":         "globe2",
@@ -138,21 +139,39 @@ _TOOL_ICON = {
     "Relleno":        "paint-bucket",
     "Pick":           "eyedropper",
     "Medir":          "rulers",
+    "Etiqueta 3D":    "tag",
+    "Polilínea":      "diagram-3",
+    "Perfil":         "graph-up",
 }
 
 
 class _ToolButton(QWidget):
     """
-    Botón de herramienta estilo TOOLBAR (QGIS / Cyclone 3DR): icono solo,
-    tamaño fijo compacto, el nombre y el atajo van en el tooltip — no como
-    texto permanente. Antes cada botón era una tarjeta grande de 56px con
-    icono+nombre+atajo apilados, ocupando mucho espacio vertical para una
-    sola fila de 9 herramientas; ahora son botones de 34×34 en una barra
-    que se acomoda en varias filas según el ancho del panel, igual que
-    cualquier barra de herramientas de un SIG.
+    Botón de herramienta — icono + NOMBRE visible siempre debajo.
+
+    REDISEÑO (2026-09-09): la versión anterior (icono solo, 34×34px, el
+    nombre solo en el tooltip) recibió la queja explícita de que "no se
+    sabe cuál herramienta es cuál" sin pasar el mouse sobre cada una y
+    esperar. Con 11 herramientas ya no alcanza con memorizar posiciones
+    en una barra — cada botón ahora es una tarjeta más grande con el
+    nombre siempre a la vista (envuelto a 2 líneas si hace falta) y un
+    icono más grande, así se puede escanear la grilla de un vistazo en
+    vez de tener que recordar qué icono es cuál herramienta.
     """
     clicked = pyqtSignal(str)
-    SIZE = 34
+    # Tamaño de referencia (un poco más chico que la versión anterior,
+    # 74×80, a pedido explícito del usuario) — el tamaño REAL en pantalla
+    # lo decide ToolPanel._relayout_tool_grid() dentro de [MIN_W, MAX_W],
+    # igual de responsivo que TileGridWidget con el tamaño de celda: un
+    # panel angosto encoge las tarjetas (nunca las saca de vista), uno
+    # ancho las agranda un poco en vez de dejar hueco vacío.
+    W, H = 64, 70
+    # MIN_W=58 (no 52): a un ancho menor, ni el tamaño de fuente más
+    # chico permitido (6px) alcanza a acomodar los nombres más largos
+    # ("Etiqueta 3D", "Polígono") sin desbordar un par de píxeles —
+    # confirmado con test. 58 deja margen de sobra en cualquier caso real.
+    MIN_W, MAX_W = 58, 84
+    _ASPECT = H / W
 
     def __init__(self, tool_cls: type, parent=None):
         super().__init__(parent)
@@ -161,14 +180,16 @@ class _ToolButton(QWidget):
         self._icon    = _TOOL_ICON.get(self._name, "grid-3x3")
         self._tooltip = getattr(tool_cls, "tooltip", "")
         self._active  = False
+        self._font_px = 8
+        self._icon_px = 22
         self.setCursor(Qt.PointingHandCursor)
         key_hint = f"  [{self._key}]" if self._key else ""
         self.setToolTip(f"{tool_cls.name}{key_hint}\n{self._tooltip}")
-        self.setFixedSize(self.SIZE, self.SIZE)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(2, 5, 2, 5)
+        lay.setSpacing(2)
         self._icon_lbl = QLabel()
         self._icon_lbl.setAlignment(Qt.AlignCenter)
         # Se neutraliza border/radio explícitamente: un stylesheet "pelado"
@@ -177,20 +198,81 @@ class _ToolButton(QWidget):
         self._icon_lbl.setStyleSheet("background:transparent;border:none;")
         lay.addWidget(self._icon_lbl)
 
+        self._name_lbl = QLabel(self._name)
+        self._name_lbl.setAlignment(Qt.AlignCenter)
+        self._name_lbl.setWordWrap(True)
+        lay.addWidget(self._name_lbl)
+
+        self.set_size(self.W, self.H)
+
+    def set_size(self, w: int, h: int) -> None:
+        """
+        Redimensiona la tarjeta completa — icono y nombre se reescalan
+        con ella (no solo el marco exterior). Llamado por
+        ToolPanel._relayout_tool_grid() en cada resize del panel.
+        """
+        w = max(self.MIN_W, min(self.MAX_W, int(w)))
+        h = max(1, int(h))
+        if (w, h) == (self.width(), self.height()) and self.width() > 0:
+            return
+        self.setFixedSize(w, h)
+        self._icon_px = max(15, min(26, int(w * 0.33)))
+        self._icon_lbl.setFixedHeight(self._icon_px + 4)
+        self._name_lbl.setFixedHeight(max(20, int(h * 0.42)))
+        # Tamaño de fuente elegido para que la palabra más larga del
+        # nombre ("Growing", "Etiqueta"...) quepa de verdad en el ancho
+        # ACTUAL — mismo principio que el fix del grid de tiles: sin
+        # esto, nombres largos como "Region Growing" se recortaban a
+        # mitad de palabra ("Growin▐") en vez de ajustarse, y además
+        # tarjetas más chicas necesitan una fuente más chica todavía.
+        self._font_px = self._fit_font_size(self._name, w - 6)
         self._update_style()
+
+    @staticmethod
+    def _fit_font_size(text: str, max_w: int) -> int:
+        """
+        Tamaño de fuente ENTERO (px) más grande, entre 9 y 5, tal que la
+        palabra más ancha de `text` quepa en max_w — evita que nombres
+        largos ("Growing", "Etiqueta") se recorten a mitad de palabra.
+
+        BUG REAL ENCONTRADO (confirmado con captura): esto antes probaba
+        tamaños con medio píxel (8.5, 7.5...) validándolos con
+        `QFont.setPixelSize(int(size))` (TRUNCA — 7.5→7px para medir),
+        pero el CSS aplicado de verdad era `font-size:7.5px` — que Qt
+        REDONDEA (7.5→8px) al renderizar. Medía a 7px, pintaba a 8px: un
+        texto que "cabía" en la medición se desbordaba en pantalla
+        ("Etiqueta" quedaba como "▐tiquet▐"). Fix: solo tamaños ENTEROS,
+        para que medir y aplicar sean exactamente lo mismo.
+
+        Rango extendido a 5px (antes 6 era el mínimo) al agregar la
+        herramienta "Polilínea": es una sola palabra de 9 caracteres (no
+        se puede partir en 2 líneas como "Region Growing") que a 6px
+        (54px) no entra en el ancho mínimo de tarjeta (MIN_W=58 → max_w=52)
+        por apenas 2px — confirmado con el arnés de tests, no a ojo.
+        """
+        words = text.split(" ") or [text]
+        for size in (9, 8, 7, 6, 5):
+            f = QFont(); f.setPixelSize(size); f.setBold(True)
+            fm = QFontMetrics(f)
+            if all(fm.horizontalAdvance(w) <= max_w for w in words):
+                return size
+        return 5
 
     def set_active(self, a: bool):
         self._active = a; self._update_style()
 
     def _update_style(self):
         color = ACCENT_STRONG if self._active else TEXT_DIM
-        self._icon_lbl.setPixmap(qpixmap(self._icon, color, 18))
+        self._icon_lbl.setPixmap(qpixmap(self._icon, color, self._icon_px))
+        self._name_lbl.setStyleSheet(
+            f"background:transparent;border:none;"
+            f"font-size:{self._font_px}px;font-weight:600;color:{color};")
         if self._active:
             self.setStyleSheet(
-                f"background:{ACCENT_SOFT};border:1px solid {ACCENT_BORDER};border-radius:3px;")
+                f"background:{ACCENT_SOFT};border:1.5px solid {ACCENT};border-radius:4px;")
         else:
             self.setStyleSheet(
-                f"background:{SURFACE};border:1px solid {BORDER};border-radius:3px;")
+                f"background:{SURFACE};border:1px solid {BORDER};border-radius:4px;")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -199,7 +281,7 @@ class _ToolButton(QWidget):
     def enterEvent(self, e):
         if not self._active:
             self.setStyleSheet(
-                f"background:{SURFACE_2};border:1px solid {ACCENT_BORDER};border-radius:3px;")
+                f"background:{SURFACE_2};border:1px solid {ACCENT_BORDER};border-radius:4px;")
 
     def leaveEvent(self, e):
         self._update_style()
@@ -226,19 +308,60 @@ class _ContextSection(QWidget):
     flood_z_tol_changed      = pyqtSignal(float)
     slice_mode_changed       = pyqtSignal(str)
     lasso_close_requested    = pyqtSignal()
+    plane_radius_changed     = pyqtSignal(float)
+    plane_threshold_changed  = pyqtSignal(float)
+    label_font_size_changed  = pyqtSignal(float)
+    label_color_changed      = pyqtSignal(tuple)
+    profile_buffer_changed   = pyqtSignal(float)
+    polyline_width_changed   = pyqtSignal(float)
+    polyline_color_changed   = pyqtSignal(tuple)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current = ""
+
+    def _hide_and_delete_layout_contents(self, lay) -> None:
+        """
+        Vacía `lay` recursivamente y esconde/marca-para-borrar cada widget
+        que encuentra — en TODOS los niveles, no solo los widgets
+        agregados directo con `root.addWidget(...)`.
+
+        BUG REAL reportado por el usuario: al cambiar de "Etiqueta 3D" o
+        "Polilínea" a otra herramienta, la fila de color (el QLabel
+        "Color de la próxima..." + el botón de color) se quedaba
+        pintada encima del panel de la herramienta nueva. Causa: esta
+        fila se agrega con `root.addLayout(color_row)`, no
+        `root.addWidget(...)` — el bucle de limpieza de antes solo
+        llamaba `item.widget()` (que da None para un item que es un
+        LAYOUT anidado, no un widget) así que nunca les tocaba el turno
+        de `hide()`/`deleteLater()`; quedaban huérfanos de layout pero
+        seguían siendo hijos visibles de _ContextSection para siempre.
+        Ahora se revisa `item.layout()` también, y si hay un layout
+        anidado se recorre con la misma lógica antes de seguir.
+        """
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # hide() inmediato — deleteLater() es diferido (espera al
+                # próximo ciclo del event loop), así que sin esto el
+                # widget viejo puede seguir PINTÁNDOSE encima del nuevo
+                # contenido durante esa ventana, produciendo texto
+                # superpuesto/fantasma (confirmado con captura real al
+                # cambiar de "Pincel" a "Ajustar plano").
+                w.hide()
+                w.deleteLater()
+                continue
+            sub = item.layout()
+            if sub is not None:
+                self._hide_and_delete_layout_contents(sub)
 
     def update_for_tool(self, name: str) -> None:
         if name == self._current: return
         self._current = name
         lay = self.layout()
         if lay:
-            while lay.count():
-                item = lay.takeAt(0)
-                if item.widget(): item.widget().deleteLater()
+            self._hide_and_delete_layout_contents(lay)
             try:
                 import sip; sip.delete(lay)
             except Exception:
@@ -313,6 +436,41 @@ class _ContextSection(QWidget):
             root.addWidget(self._sr)
             root.addWidget(self._hint("Ctrl+clic para seleccionar"))
 
+        # ── Ajustar plano (RANSAC) ────────────────────────────────────────────
+        elif name == "Ajustar plano":
+            root.addWidget(self._hint(
+                "Ctrl+clic → ajusta el plano dentro del radio y pinta "
+                "solo lo plano (círculo naranja = radio)", OK))
+            self._pr = _SliderRow("Radio", "m", 1, 100, int(5))
+            self._pr.value_changed.connect(self.plane_radius_changed)
+            root.addWidget(self._pr)
+            self._pth = _SliderRow("Tolerancia", "cm", 1, 100, 8)
+            self._pth.value_changed.connect(lambda v: self.plane_threshold_changed.emit(v / 100.0))
+            root.addWidget(self._pth)
+            root.addWidget(self._hint("Tolerancia alta = acepta superficies más rugosas"))
+
+        # ── Etiqueta 3D ───────────────────────────────────────────────────────
+        elif name == "Etiqueta 3D":
+            root.addWidget(self._hint("Ctrl+clic → coloca una etiqueta"))
+            root.addWidget(self._hint(
+                "Ctrl+clic sobre una ya puesta → editarla o eliminarla", OK))
+            self._lfs = _SliderRow("Tamaño de letra", "pt", 8, 48, 14)
+            self._lfs.value_changed.connect(self.label_font_size_changed)
+            root.addWidget(self._lfs)
+
+            color_row = QHBoxLayout()
+            color_lbl = QLabel("Color de la próxima etiqueta")
+            color_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10.5px;")
+            color_row.addWidget(color_lbl)
+            self._label_color = (1.0, 0.85, 0.2)
+            self._label_color_btn = QPushButton()
+            self._label_color_btn.setFixedSize(46, 20)
+            self._update_label_color_btn()
+            self._label_color_btn.clicked.connect(self._pick_label_color)
+            color_row.addWidget(self._label_color_btn)
+            color_row.addStretch()
+            root.addLayout(color_row)
+
         # ── Corte Z ───────────────────────────────────────────────────────────
         elif name == "Corte Z":
             root.addWidget(self._hint("Ctrl+clic → base Z"))
@@ -377,8 +535,40 @@ class _ContextSection(QWidget):
             self._mz  = self._info_row("dZ",       "—")
             for w in [self._m3d, self._m2d, self._mz]:
                 root.addWidget(w)
-            root.addWidget(self._hint("Clic A → clic B"))
-            root.addWidget(self._hint("Escape → reiniciar"))
+            root.addWidget(self._hint("Clic A → clic B mide"))
+            root.addWidget(self._hint("Ctrl+clic sobre una medida → editarla o eliminarla", OK))
+            root.addWidget(self._hint("Escape → cancelar el punto A"))
+
+        # ── Polilínea ─────────────────────────────────────────────────────────
+        elif name == "Polilínea":
+            root.addWidget(self._hint("Ctrl+clic → agrega un vértice · Enter la guarda", OK))
+            root.addWidget(self._hint("Backspace quita el último vértice · Escape cancela"))
+            root.addWidget(self._hint("Ctrl+clic sobre una ya puesta → editarla o eliminarla", OK))
+
+            self._plw = _SliderRow("Grosor de línea", "px", 1, 12, 3, 0.5)
+            self._plw.value_changed.connect(self.polyline_width_changed)
+            root.addWidget(self._plw)
+
+            color_row = QHBoxLayout()
+            color_lbl = QLabel("Color de la próxima polilínea")
+            color_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10.5px;")
+            color_row.addWidget(color_lbl)
+            self._polyline_color = (0.2, 0.85, 1.0)
+            self._polyline_color_btn = QPushButton()
+            self._polyline_color_btn.setFixedSize(46, 20)
+            self._update_polyline_color_btn()
+            self._polyline_color_btn.clicked.connect(self._pick_polyline_color)
+            color_row.addWidget(self._polyline_color_btn)
+            color_row.addStretch()
+            root.addLayout(color_row)
+
+        # ── Perfil (corte vertical) ──────────────────────────────────────────
+        elif name == "Perfil":
+            root.addWidget(self._hint("Ctrl+clic A · clic B → corte vertical de la franja", OK))
+            self._pfb = _SliderRow("Ancho de franja", "m", 1, 100, int(2))
+            self._pfb.value_changed.connect(self.profile_buffer_changed)
+            root.addWidget(self._pfb)
+            root.addWidget(self._hint("Escape → cancelar el punto A"))
 
         root.addStretch()
 
@@ -405,6 +595,34 @@ class _ContextSection(QWidget):
         for lbl in widget.findChildren(QLabel):
             if lbl.objectName().startswith("val_"):
                 lbl.setText(text); return
+
+    def _update_label_color_btn(self) -> None:
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._label_color)
+        self._label_color_btn.setStyleSheet(
+            f"background: rgb({r},{g},{b}); border: 1px solid {BORDER}; border-radius: 3px;")
+
+    def _pick_label_color(self) -> None:
+        from PyQt5.QtWidgets import QColorDialog
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._label_color)
+        picked = QColorDialog.getColor(QColor(r, g, b), self, "Color de la etiqueta")
+        if picked.isValid():
+            self._label_color = (picked.redF(), picked.greenF(), picked.blueF())
+            self._update_label_color_btn()
+            self.label_color_changed.emit(self._label_color)
+
+    def _update_polyline_color_btn(self) -> None:
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._polyline_color)
+        self._polyline_color_btn.setStyleSheet(
+            f"background: rgb({r},{g},{b}); border: 1px solid {BORDER}; border-radius: 3px;")
+
+    def _pick_polyline_color(self) -> None:
+        from PyQt5.QtWidgets import QColorDialog
+        r, g, b = (int(max(0, min(1, c)) * 255) for c in self._polyline_color)
+        picked = QColorDialog.getColor(QColor(r, g, b), self, "Color de la polilínea")
+        if picked.isValid():
+            self._polyline_color = (picked.redF(), picked.greenF(), picked.blueF())
+            self._update_polyline_color_btn()
+            self.polyline_color_changed.emit(self._polyline_color)
 
     def _cycle_slice_mode(self):
         modes = [("between", "Entre dos planos"), ("above", "Encima del plano"),
@@ -459,6 +677,13 @@ class ToolPanel(QWidget):
     rg_use_rgb_changed   = pyqtSignal(bool)
     rg_use_z_changed     = pyqtSignal(bool)
     radius_changed          = pyqtSignal(float)    # sphere radius
+    plane_radius_changed    = pyqtSignal(float)
+    plane_threshold_changed = pyqtSignal(float)
+    label_font_size_changed = pyqtSignal(float)
+    label_color_changed     = pyqtSignal(tuple)
+    profile_buffer_changed  = pyqtSignal(float)
+    polyline_width_changed  = pyqtSignal(float)
+    polyline_color_changed  = pyqtSignal(tuple)
     # Señales de opciones globales
     erase_mode_changed      = pyqtSignal(bool)
     delete_mode_changed     = pyqtSignal(bool)
@@ -475,6 +700,7 @@ class ToolPanel(QWidget):
     show_unlabeled_toggled  = pyqtSignal(bool)
     grid_toggled            = pyqtSignal(bool)
     edl_toggled              = pyqtSignal(bool)
+    clip_box_toggled         = pyqtSignal(bool)
     # Exportar
     export_requested        = pyqtSignal()
 
@@ -486,7 +712,11 @@ class ToolPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(180)
-        self.setMaximumWidth(400)
+        # Antes 400 — el usuario pidió poder ensancharlo más de lo que
+        # dejaba. La grilla de herramientas ahora es responsiva en tamaño
+        # Y columnas (ver _relayout_tool_grid), así que un panel más ancho
+        # se aprovecha bien en vez de dejar espacio vacío.
+        self.setMaximumWidth(650)
         self._btns:       Dict[str, _ToolButton] = {}
         self._active_name = ALL_TOOLS[0].name
         self._build_ui()
@@ -528,18 +758,59 @@ class ToolPanel(QWidget):
         return frame, content
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        # BUG REAL REPORTADO (2026-09-09): sin scroll, el panel entero
+        # dependía de que TODAS las tarjetas (Herramientas + Anotación +
+        # Contexto dinámico + Visualización) cupieran en la altura fija
+        # del dock. Con una herramienta SIN parámetros (ej. Pick) cabía
+        # bien: pero con una que sí tiene varios controles (Pincel: 3
+        # sliders + 2 hints; Ajustar plano: 2 sliders + 3 hints) el panel
+        # se quedaba sin alto y Qt comprimía/amontonaba todo — el layout
+        # se veía "roto" literalmente porque no tenía a dónde crecer. Fix:
+        # todo el contenido vive en un widget interno dentro de un
+        # QScrollArea — si una herramienta necesita más espacio que el
+        # que hay disponible, el panel simplemente da scroll en vez de
+        # aplastar el contenido.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            f"QScrollBar:vertical{{background:{SURFACE_2};width:8px;border:none;margin:0;}}"
+            f"QScrollBar::handle:vertical{{background:{BORDER};border-radius:4px;min-height:24px;}}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:none;}")
+
+        content = QWidget()
+        content.setStyleSheet("background:transparent;")
+        root = QVBoxLayout(content)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
         # ── Barra de herramientas (estilo QGIS/Cyclone 3DR) ───────────────────
         # Tira de iconos compacta, varias filas si hace falta — el nombre y
         # el atajo van en el tooltip, no como texto fijo bajo cada icono.
-        toolbar_frame = QFrame()
-        toolbar_frame.setObjectName("toolbar")
-        toolbar_frame.setStyleSheet(
+        #
+        # REDISEÑO (2026-09-09) — grilla RESPONSIVA en vez de un número fijo
+        # de columnas: con `ncols` fijo, un panel angosto podía dejar
+        # herramientas recortadas/fuera de vista por la derecha, y uno
+        # ancho dejaba una franja de espacio vacío en vez de aprovecharla
+        # para acomodar más columnas (y así menos filas — más bajo de
+        # alto). Ahora `_relayout_tool_grid()` recalcula cuántas columnas
+        # caben de verdad según el ancho disponible cada vez que el panel
+        # cambia de tamaño (ver resizeEvent), y reacomoda los mismos
+        # botones — nunca se crean ni se destruyen widgets, solo se
+        # mueven de celda.
+        self._toolbar_frame = QFrame()
+        self._toolbar_frame.setObjectName("toolbar")
+        self._toolbar_frame.setStyleSheet(
             f"QFrame#toolbar{{background:{SURFACE_2};border:1px solid {BORDER};border-radius:4px;}}")
-        tb_outer = QVBoxLayout(toolbar_frame)
+        tb_outer = QVBoxLayout(self._toolbar_frame)
         tb_outer.setContentsMargins(8, 6, 8, 8)
         tb_outer.setSpacing(4)
         # "Ctrl+clic" ya no va en el título — cada botón lo explica en su
@@ -547,18 +818,19 @@ class ToolPanel(QWidget):
         # de línea a mitad de palabra ("Ctrl+" / "clic").
         tb_outer.addWidget(self._section_lbl("HERRAMIENTAS"))
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(4)
-        ncols = 7
-        for i, tc in enumerate(ALL_TOOLS):
+        self._tool_grid = QGridLayout()
+        self._tool_grid.setContentsMargins(0, 0, 0, 0)
+        self._tool_grid.setSpacing(4)
+        self._tool_btn_order: list = []
+        for tc in ALL_TOOLS:
             btn = _ToolButton(tc)
             btn.clicked.connect(self._on_tool_clicked)
             self._btns[tc.name] = btn
-            grid.addWidget(btn, i // ncols, i % ncols, Qt.AlignLeft)
-        grid_host = QHBoxLayout(); grid_host.addLayout(grid); grid_host.addStretch()
+            self._tool_btn_order.append(btn)
+        grid_host = QHBoxLayout(); grid_host.addLayout(self._tool_grid); grid_host.addStretch()
         tb_outer.addLayout(grid_host)
-        root.addWidget(toolbar_frame)
+        root.addWidget(self._toolbar_frame)
+        self._relayout_tool_grid(force=True)
 
         # ── Modo de anotación ─────────────────────────────────────────────────
         opt_card, opt_l = self._card("ANOTACIÓN", "sliders2")
@@ -619,6 +891,13 @@ class ToolPanel(QWidget):
         self._ctx.brush_overlap_changed.connect(self.brush_overlap_changed)
         self._ctx.brush_thickness_changed.connect(self.brush_thickness_changed)
         self._ctx.sphere_radius_changed.connect(self.radius_changed)
+        self._ctx.plane_radius_changed.connect(self.plane_radius_changed)
+        self._ctx.plane_threshold_changed.connect(self.plane_threshold_changed)
+        self._ctx.label_font_size_changed.connect(self.label_font_size_changed)
+        self._ctx.label_color_changed.connect(self.label_color_changed)
+        self._ctx.profile_buffer_changed.connect(self.profile_buffer_changed)
+        self._ctx.polyline_width_changed.connect(self.polyline_width_changed)
+        self._ctx.polyline_color_changed.connect(self.polyline_color_changed)
         self._ctx.flood_step_changed.connect(self.flood_step_changed)
         self._ctx.flood_max_pts_changed.connect(self.flood_max_pts_changed)
         self._ctx.flood_z_tol_changed.connect(self.flood_z_tol_changed)
@@ -638,6 +917,7 @@ class ToolPanel(QWidget):
             ("Ver sin etiquetar", "_tog_unl",  True,  self.show_unlabeled_toggled),
             ("Grilla de fondo",   "_tog_grid", False, self.grid_toggled),
             ("Eye-Dome Lighting", "_tog_edl",  False, self.edl_toggled),
+            ("Caja de recorte",   "_tog_clipbox", False, self.clip_box_toggled),
         ]:
             row = QWidget(); row.setStyleSheet("background:transparent;")
             rl  = QHBoxLayout(row); rl.setContentsMargins(0, 2, 0, 2)
@@ -651,6 +931,12 @@ class ToolPanel(QWidget):
                        "bordes de la nube sin necesitar normales — más "
                        "fácil de leer la geometría en modo Elevación o "
                        "Color único. Tiene un costo de rendimiento leve.")
+                ll.setToolTip(tip); tog.setToolTip(tip)
+            elif attr == "_tog_clipbox":
+                tip = ("Caja 3D interactiva para aislar un volumen — "
+                       "arrastra sus caras (naranja) para recortar la "
+                       "vista. No borra nada, solo oculta temporalmente "
+                       "lo que queda fuera (igual que en CloudCompare).")
                 ll.setToolTip(tip); tog.setToolTip(tip)
             setattr(self, attr, tog)
             rl.addWidget(ll); rl.addStretch(); rl.addWidget(tog)
@@ -675,6 +961,9 @@ class ToolPanel(QWidget):
         vis_l.addWidget(cc_row)
         root.addWidget(vis_card)
 
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
         # Activar primera herramienta
         first = ALL_TOOLS[0].name
         if first in self._btns:
@@ -696,6 +985,67 @@ class ToolPanel(QWidget):
         lbl.setWordWrap(True)
         lbl.setStyleSheet(f"color:{TEXT_MUTE}; font-size:10.5px; font-weight:700; letter-spacing:0.5px;")
         return lbl
+
+    # ── Grilla de herramientas responsiva ────────────────────────────────────
+
+    def _relayout_tool_grid(self, force: bool = False) -> None:
+        """
+        Recalcula CUÁNTAS COLUMNAS caben Y el TAMAÑO de cada tarjeta en el
+        ancho actual del panel — mismo espíritu que TileGridWidget
+        (core del grid de tiles): ahí la cantidad de filas/columnas la
+        pone la nube, pero el tamaño de celda se adapta al ancho
+        disponible; aquí es al revés (el número de herramientas es fijo),
+        así que se adapta tanto cuántas entran por fila como qué tan
+        grande se ve cada una.
+
+        - Panel angosto: primero se buscan más columnas achicando las
+          tarjetas hasta MIN_W — nunca se recortan/desaparecen fuera de
+          vista por la derecha, se ven más chicas pero completas.
+        - Panel ancho: las tarjetas crecen hasta MAX_W para llenar el
+          espacio en vez de dejarlo vacío; más allá de eso, se suman
+          columnas.
+        """
+        if not hasattr(self, "_tool_grid") or not self._tool_btn_order:
+            return
+        # Ancho disponible real: el del propio panel menos márgenes/
+        # padding acumulados de root + tarjeta (10+10 del root, 8+8 del
+        # frame) y un margen para la barra de scroll vertical.
+        avail = max(_ToolButton.MIN_W, self.width() - 44)
+        spacing = self._tool_grid.spacing() or 4
+        n_tools = len(self._tool_btn_order)
+
+        # 1) Punto de partida: cuántas columnas caben a tamaño de
+        # referencia (W=64) — así un resize pequeño solo cambia el
+        # TAMAÑO de las tarjetas (suave, como el cell_sz del grid de
+        # tiles), y el número de columnas solo salta cuando de verdad
+        # hace falta (paso 2).
+        ncols = max(1, min(n_tools, round((avail + spacing) / (_ToolButton.W + spacing))))
+        # 2) Corrección: si con ese ncols las tarjetas quedarían más
+        # chicas que MIN_W, sacar una columna (repartir el mismo ancho
+        # entre menos tarjetas → cada una más grande); si quedarían más
+        # grandes que MAX_W, agregar una columna (space de sobra para
+        # una más, en vez de dejarlo vacío).
+        while ncols > 1 and (avail - spacing * (ncols - 1)) / ncols < _ToolButton.MIN_W:
+            ncols -= 1
+        while ncols < n_tools and (avail - spacing * (ncols - 1)) / ncols > _ToolButton.MAX_W:
+            ncols += 1
+
+        btn_w = (avail - spacing * (ncols - 1)) / ncols
+        btn_w = int(max(_ToolButton.MIN_W, min(_ToolButton.MAX_W, btn_w)))
+        btn_h = int(round(btn_w * _ToolButton._ASPECT))
+
+        state = (ncols, btn_w)
+        if not force and state == getattr(self, "_tool_grid_state", None):
+            return
+        self._tool_grid_state = state
+        self._tool_grid_ncols = ncols   # expuesto para tests/depuración
+        for i, btn in enumerate(self._tool_btn_order):
+            btn.set_size(btn_w, btn_h)
+            self._tool_grid.addWidget(btn, i // ncols, i % ncols, Qt.AlignLeft)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._relayout_tool_grid()
 
     # ── Eventos ───────────────────────────────────────────────────────────────
 

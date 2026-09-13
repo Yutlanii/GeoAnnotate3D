@@ -28,3 +28,8 @@ scipy>=1.9.0
 h5py>=3.8.0          # exportar .h5 para PointNet++
 open3d>=0.17.0       # cargar PLY grandes más rápido
 psutil>=5.9.0        # detección dinámica de RAM disponible
+
+# Entrenamiento/inferencia (no listado aquí: torch — ver el instalador,
+# que empaqueta una build CUDA; instálalo tú mismo si corres desde código
+# fuente, ver https://pytorch.org/get-started/locally/)
+onnx>=1.14.0         # solo necesario para "Exportar a ONNX" (Paso 5 — Entrenar)

@@ -13,6 +13,24 @@ Key fixes:
      User never sees density drop on re-render.
 
   3. BUDGET GROWS MONOTONICALLY: never drops below current rendered pts.
+
+REVERT v8.0 → v7.0 (2026-09-09, misma sesión que lo implementó): v8.0
+agregaba frustum culling real + priorización por distancia
+(core/octree.py::iter_progressive_lod) al pipeline de Overview. Se
+había verificado con PLANOS SINTÉTICOS construidos a mano en los tests
+(nunca con una cámara VTK real — `AnnotationCanvas` no se puede
+instanciar en este entorno sin GPU, ver limitación conocida). El usuario
+reportó, usando la app de verdad, que al abrir una nube (Overview, sin
+necesidad de tiles) desaparecía la mayor parte de la nube y solo
+quedaba visible un pedazo con densidad baja — exactamente el síntoma de
+un frustum mal orientado combinado con recorte por distancia agresivo.
+Sin poder reproducir ni depurar esto con una cámara real aquí, la
+decisión responsable es revertir a v7.0 (presupuesto plano, sin
+frustum) en vez de seguir iterando a ciegas sobre el pipeline de render
+principal — `core/octree.py::iter_progressive_lod`/
+`_candidate_lod_for_budget` quedan definidos pero SIN USARSE desde aquí
+(no se borraron, por si una sesión futura con GPU real quiere retomar
+el diseño con poder verificarlo en vivo).
 """
 from __future__ import annotations
 import threading
@@ -36,6 +54,8 @@ class LODWorker(QThread):
         self._project = None
         self._ann_lut_u8 = None
         self._eye3d = None
+        self._frustum_planes = None
+        self._fov_deg = 45.0
         self._W = self._H = 0.0
         self._max_pts = 0
         self._cm = "Anotación"
@@ -60,7 +80,9 @@ class LODWorker(QThread):
             self._project = project
             self._ann_lut_u8 = annotation_lut_u8
             self._eye3d = eye3d.copy() if eye3d is not None else None
-            # NOTE: frustum_planes intentionally NOT stored — no frustum in LOD
+            self._frustum_planes = (frustum_planes.copy()
+                                     if frustum_planes is not None else None)
+            self._fov_deg = fov_deg
             self._W, self._H = W, H
             self._max_pts = max_pts
             self._cm, self._cmap = color_mode, cmap
@@ -79,6 +101,9 @@ class LODWorker(QThread):
                 pc = self._pc
                 project = self._project
                 ann_lut_u8 = self._ann_lut_u8
+                eye3d = self._eye3d
+                frustum_planes = self._frustum_planes
+                fov_deg = self._fov_deg
                 W, H = self._W, self._H
                 max_pts = self._max_pts
                 cm, cmap = self._cm, self._cmap
@@ -88,7 +113,8 @@ class LODWorker(QThread):
                 continue
             try:
                 self._refine(pc, project, ann_lut_u8,
-                              W, H, max_pts, cm, cmap, epoch)
+                              eye3d, frustum_planes, W, H, fov_deg,
+                              max_pts, cm, cmap, epoch)
             except Exception:
                 import traceback; traceback.print_exc()
 
@@ -97,7 +123,8 @@ class LODWorker(QThread):
             return self._cancel or self._req or self._epoch != epoch
 
     def _refine(self, pc, project, ann_lut_u8,
-                W, H, max_pts, cm, cmap, epoch):
+                eye3d, frustum_planes, W, H, fov_deg,
+                max_pts, cm, cmap, epoch):
         from core._fast import FC
         from render.colors import get_z_range, _Z_RANGE_CACHE, _get_lut_u8
 

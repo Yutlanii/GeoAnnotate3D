@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QProgressBar,
     QFrame, QSplitter, QGroupBox, QScrollArea, QFileDialog,
-    QCheckBox, QSizePolicy,
+    QCheckBox, QSizePolicy, QMessageBox, QApplication,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
@@ -544,12 +544,31 @@ class TrainingWorker(QThread):
         """
         import torch, torch.nn as nn, torch.nn.functional as F
 
-        def knn_idx(xyz, k):
-            """KNN (B,3,N) → (B,N,k)."""
+        def knn_idx(xyz, k, chunk=2048):
+            """
+            KNN (B,3,N) → (B,N,k), calculado por bloques de filas.
+
+            La versión anterior armaba la matriz de distancias COMPLETA
+            (B,N,N) de una sola vez (`xy.unsqueeze(2) - xy.unsqueeze(1)`).
+            Para un parche de N puntos eso son B·N² floats: con N=65536
+            (el tope que permite el spinbox "Pts/parche") y batch=2, son
+            2·65536²·4 bytes ≈ 32 GiB — confirmado en la práctica con un
+            CUDA OOM pidiendo exactamente eso en una GPU de 8GB, tanto en
+            entrenamiento como en inferencia (ambos pasan por este mismo
+            _build_kpconv). Calculándola en bloques de `chunk` filas contra
+            TODOS los puntos, el pico de memoria baja a B·chunk·N floats
+            (con chunk=2048 y el mismo N=65536,B=2: ≈1 GiB) — mismo
+            resultado exacto, solo que no se materializa todo de golpe.
+            """
             B,_,N = xyz.shape; k = min(k, N-1)
-            xy = xyz.permute(0,2,1)
-            dist = (xy.unsqueeze(2) - xy.unsqueeze(1)).pow(2).sum(-1)   # (B,N,N)
-            return dist.topk(k+1, dim=-1, largest=False).indices[:,:,1:] # (B,N,k)
+            xy = xyz.permute(0,2,1)   # (B,N,3)
+            idx_chunks = []
+            for start in range(0, N, chunk):
+                end   = min(start+chunk, N)
+                block = xy[:, start:end]                                   # (B,c,3)
+                dist  = (block.unsqueeze(2) - xy.unsqueeze(1)).pow(2).sum(-1)  # (B,c,N)
+                idx_chunks.append(dist.topk(k+1, dim=-1, largest=False).indices[:,:,1:])
+            return torch.cat(idx_chunks, dim=1)   # (B,N,k)
 
         class KPConvLayer(nn.Module):
             """
@@ -622,7 +641,12 @@ class TrainingWorker(QThread):
         from torch.utils.data import DataLoader
 
         GeoAnnotateDataset = ds_mod.GeoAnnotateDataset
-        get_class_weights   = ds_mod.get_class_weights
+        # getattr con default: el custom_dataset.py de PointNet++/KPConv no
+        # siempre trae get_class_weights (algunas plantillas exportadas antes
+        # de este fix no lo definían — ver annotation/exporter.py). Sin esto,
+        # entrenar con uno de esos custom_dataset.py más viejos crasheaba acá
+        # con AttributeError antes de completar ni una época.
+        get_class_weights = getattr(ds_mod, 'get_class_weights', None)
         try:
             tds = GeoAnnotateDataset(data_dir,"train",pts,augment=True)
             vds = GeoAnnotateDataset(data_dir,"val",  pts,augment=False)
@@ -639,7 +663,11 @@ class TrainingWorker(QThread):
                            "Asegúrate de haber exportado el dataset (Paso 4).")
             return
 
-        w = get_class_weights(data_dir)
+        w = get_class_weights(data_dir) if get_class_weights is not None else None
+        if w is None and get_class_weights is None:
+            self.log_line.emit(
+                f"[{arch}] custom_dataset.py no trae get_class_weights "
+                "(regenera el export para tenerlo) — entrenando sin loss ponderado")
         if w is not None and len(w) != actual_nc:
             self.log_line.emit(f"[{arch}] Weight shape mismatch ({len(w)} vs {actual_nc}), ignorando")
             w = None
@@ -655,6 +683,51 @@ class TrainingWorker(QThread):
         best_epoch_stats = None
         best_path = str(os.path.join(out_dir, "best_model.pth"))
         start_epoch = 1
+
+        # ── Fine-tuning desde checkpoint EXTERNO ────────────────────────────
+        # A diferencia de "Reanudar" (mismo entrenamiento: retoma epoch,
+        # optimizer y scheduler tal cual, exige que las formas de TODOS los
+        # tensores calcen) esto es un entrenamiento NUEVO que solo reusa los
+        # pesos de otro checkpoint como punto de partida — se cargan capa
+        # por capa SOLO las que coincidan en nombre Y forma; el resto
+        # (típicamente la última capa de clasificación, si el checkpoint
+        # viene de un proyecto con otro número de clases) se deja con la
+        # inicialización aleatoria de `model` tal cual se construyó. Un
+        # checkpoint resume_from ya trae todo lo que esto haría (y más:
+        # epoch/optimizer), así que si el usuario configuró ambos, resume
+        # gana y esto se ignora en silencio (documentado en el tooltip del
+        # botón de fine-tuning, no hace falta advertir dos veces).
+        finetune_from = self._cfg.get("finetune_from")
+        if finetune_from and not resume_from:
+            try:
+                ckpt = torch.load(finetune_from, map_location=device)
+                src_state = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
+                own_state = model.state_dict()
+                new_state, loaded, skipped = dict(own_state), [], []
+                for k, v in own_state.items():
+                    sv = src_state.get(k) if isinstance(src_state, dict) else None
+                    if sv is not None and tuple(sv.shape) == tuple(v.shape):
+                        new_state[k] = sv
+                        loaded.append(k)
+                    else:
+                        skipped.append(k)
+                model.load_state_dict(new_state)
+                self.log_line.emit(
+                    f"[{arch}] Fine-tuning desde {finetune_from}: "
+                    f"{len(loaded)}/{len(own_state)} tensores reusados, "
+                    f"{len(skipped)} reinicializados"
+                    + (f" (incluye: {', '.join(skipped[:3])}"
+                       f"{'…' if len(skipped) > 3 else ''})" if skipped else "") + ".")
+                if not loaded:
+                    self.log_line.emit(
+                        f"[WARNING] Ningún tensor coincidió por nombre+forma — "
+                        f"probablemente ese checkpoint es de una arquitectura "
+                        f"distinta a esta implementación de {arch}. "
+                        f"Entrenando con pesos aleatorios.")
+            except Exception as e:
+                self.log_line.emit(
+                    f"[WARNING] No se pudo cargar el checkpoint de fine-tuning "
+                    f"({finetune_from}): {e}\n           Empezando con pesos aleatorios.")
 
         # ── Reanudar desde checkpoint ──────────────────────────────────────
         # Antes no existía forma de continuar un entrenamiento largo tras
@@ -827,6 +900,85 @@ class TrainingWorker(QThread):
                     f.write(f"  - {r['name']}: IoU={r['iou']:.4f}\n")
         return txt_path
 
+    def export_onnx(self, arch: str, num_classes: int, checkpoint_path: str,
+                    out_path: str, num_points: int = 4096) -> dict:
+        """
+        Exporta un checkpoint YA entrenado (best_model.pth) a formato ONNX,
+        para poder correr inferencia fuera de esta app (otros pipelines,
+        dispositivos "edge", servidores sin PyTorch instalado, etc.) — no
+        se ejecuta desde un QThread real, se llama directamente sobre una
+        instancia de TrainingWorker creada solo para reusar los mismos
+        `_build_*` que ya construyen exactamente la misma arquitectura
+        usada al entrenar (así el checkpoint SIEMPRE calza en forma).
+
+        Devuelve {"missing": [...], "unexpected": [...], "note": str} —
+        `missing`/`unexpected` vienen de `load_state_dict(strict=False)`:
+        si no están vacíos, el checkpoint no calza del todo con esta
+        arquitectura (por ejemplo, se entrenó con otro número de clases) y
+        el modelo exportado tiene esas capas con pesos SIN ENTRENAR.
+        """
+        import torch
+        model = self._build_model(arch, num_classes)
+        model.eval()
+
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        state = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
+        result = model.load_state_dict(state, strict=False)
+        missing    = list(getattr(result, "missing_keys", []) or [])
+        unexpected = list(getattr(result, "unexpected_keys", []) or [])
+
+        # Las tres arquitecturas construidas por _build_model esperan
+        # siempre 9 canales de entrada (x,y,z + 6 más: intensidad/rgb/norm
+        # según el caso — ver _build_randlanet/_build_pointnetpp/_build_kpconv,
+        # todas hardcodean 9 en su primera capa) — el número de PUNTOS sí es
+        # configurable (num_points), y queda como eje dinámico en el ONNX
+        # exportado para no fijar un tamaño de nube único.
+        dummy = torch.randn(1, 9, int(num_points))
+
+        note = ""
+        patched_randperm = False
+        if arch == "RandLA-Net":
+            # RandLA-Net submuestrea con torch.randperm() en su forward —
+            # ONNX (probado: opset 13) NO tiene un operador equivalente a
+            # "aten::randperm" en absoluto, así que exportar tal cual falla
+            # con UnsupportedOperatorError (confirmado exportando de
+            # verdad, no es una suposición). Un número aleatorio distinto
+            # en cada inferencia tampoco tendría sentido para un grafo ONNX
+            # fijo — así que para la duración de ESTE export se reemplaza
+            # temporalmente torch.randperm por un muestreo DETERMINISTA
+            # (los primeros N puntos, sin barajar) y se restaura apenas
+            # termina; el resultado es un grafo ONNX válido cuyo
+            # submuestreo es fijo en vez de aleatorio en cada corrida.
+            note = (
+                "RandLA-Net submuestrea aleatoriamente (torch.randperm) en "
+                "PyTorch, pero ONNX no tiene un operador equivalente — el "
+                "modelo exportado usa en su lugar un submuestreo FIJO "
+                "(los primeros N puntos de cada nivel) en vez de aleatorio. "
+                "Esto puede afectar ligeramente la calidad frente al modelo "
+                "original en PyTorch; si eso importa para tu caso de uso, "
+                "PointNet++ o KPConv exportan sin esta salvedad (no usan "
+                "submuestreo aleatorio)."
+            )
+            orig_randperm = torch.randperm
+            def _deterministic_randperm(n, *a, **kw):
+                device = kw.get("device")
+                return torch.arange(n, device=device) if device is not None else torch.arange(n)
+            torch.randperm = _deterministic_randperm
+            patched_randperm = True
+
+        try:
+            torch.onnx.export(
+                model, dummy, out_path,
+                input_names=["points"], output_names=["logits"],
+                dynamic_axes={"points": {0: "batch", 2: "num_points"},
+                              "logits": {0: "batch", 2: "num_points"}},
+                opset_version=13)
+        finally:
+            if patched_randperm:
+                torch.randperm = orig_randperm
+
+        return {"missing": missing, "unexpected": unexpected, "note": note}
+
     def _train_pointnet(self, data_dir, out_dir, epochs, batch, lr, pts,
                         num_classes, class_names, device):
         import torch, importlib.util as _ilu
@@ -985,6 +1137,46 @@ class TrainingPanel(QWidget):
         resume_row.addWidget(resume_btn)
         cgl.addLayout(resume_row)
 
+        # Fine-tuning desde un checkpoint EXTERNO — a diferencia de
+        # "Reanudar" (mismo entrenamiento, mismas clases, retoma
+        # optimizer/scheduler/epoch tal cual), esto empieza un
+        # entrenamiento NUEVO (epoch 1, optimizer/scheduler frescos) pero
+        # parte de los pesos de otro checkpoint en vez de al azar — carga
+        # capa por capa SOLO las que coincidan en forma, y reinicializa el
+        # resto (típicamente la(s) capa(s) de clasificación final, cuando
+        # el checkpoint viene de un proyecto con otro número de clases).
+        # Sirve para: (a) continuar aprendiendo sobre datos/clases nuevas
+        # a partir de un modelo ya entrenado con esta misma app en otro
+        # proyecto, o (b) un checkpoint de otro origen cuyos nombres de
+        # capa coincidan — un checkpoint oficial de RandLA-Net/PointNet++
+        # entrenado con el repo original NO calza por nombre de capa (esta
+        # app reimplementa cada arquitectura con su propio código), así
+        # que en ese caso el log mostrará "0 tensores cargados" en vez de
+        # fallar en silencio o fingir que sí sirvió de base.
+        self._finetune_path = None
+        finetune_row = QHBoxLayout(); finetune_row.setSpacing(6)
+        finetune_lbl = QLabel("Fine-tuning"); finetune_lbl.setStyleSheet(
+            f"color:{TEXT_MUTE};font-size:10.5px;min-width:74px;")
+        finetune_row.addWidget(finetune_lbl)
+        self._finetune_lbl = QLabel("(pesos aleatorios)")
+        self._finetune_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
+        self._finetune_lbl.setWordWrap(True)
+        finetune_row.addWidget(self._finetune_lbl, 1)
+        finetune_btn = QPushButton()
+        finetune_btn.setIcon(qicon("upload", TEXT_DIM)); finetune_btn.setFixedSize(26, 24)
+        finetune_btn.setToolTip(
+            "Elegir un checkpoint (.pth) externo como PUNTO DE PARTIDA — "
+            "entrenamiento nuevo, no continúa el de ese checkpoint; solo "
+            "reusa los pesos que calcen en forma (típico: mismo backbone, "
+            "otra cantidad de clases)")
+        finetune_btn.setStyleSheet(
+            f"QPushButton{{background:{SURFACE_2};border:1px solid {BORDER};"
+            f"border-radius:3px;}}"
+            f"QPushButton:hover{{border-color:{ACCENT};background:{ACCENT_SOFT};}}")
+        finetune_btn.clicked.connect(self._browse_finetune_checkpoint)
+        finetune_row.addWidget(finetune_btn)
+        cgl.addLayout(finetune_row)
+
         ll.addWidget(cfg_gb)
 
         # Buttons
@@ -1011,6 +1203,21 @@ class TrainingPanel(QWidget):
         btn_row.addWidget(self._start_btn, 1)
         btn_row.addWidget(self._stop_btn)
         ll.addLayout(btn_row)
+
+        # Exportar a ONNX — para correr inferencia fuera de esta app (otros
+        # pipelines, dispositivos sin PyTorch, servidores de inferencia,
+        # etc.), a partir de un checkpoint YA entrenado. Independiente del
+        # entrenamiento en curso — no requiere que haya uno activo, solo un
+        # archivo .pth ya guardado (de esta sesión o de una anterior).
+        onnx_btn = QPushButton("  Exportar a ONNX…")
+        onnx_btn.setIcon(qicon("cloud-arrow-up", TEXT_DIM))
+        onnx_btn.setStyleSheet(
+            f"QPushButton{{background:{SURFACE_2};border:1px solid {BORDER};"
+            f"border-radius:4px;padding:8px;font-size:10.5px;color:{TEXT_DIM};"
+            f"font-weight:600;text-align:left;}}"
+            f"QPushButton:hover{{border-color:{ACCENT};color:{ACCENT_STRONG};}}")
+        onnx_btn.clicked.connect(self._on_export_onnx)
+        ll.addWidget(onnx_btn)
 
         # Progress
         self._progress = QProgressBar()
@@ -1166,6 +1373,68 @@ class TrainingPanel(QWidget):
         # (sin "else": si el usuario cancela el diálogo, se conserva la
         # selección previa — no se limpia _resume_path por accidente)
 
+    def _browse_finetune_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar checkpoint externo para fine-tuning", "",
+            "Checkpoints PyTorch (*.pth *.pt);;Todos (*)")
+        if path:
+            self._finetune_path = path
+            self._finetune_lbl.setText(f"…/{Path(path).parent.name}/{Path(path).name}")
+            self._finetune_lbl.setToolTip(path)
+
+    def _on_export_onnx(self):
+        """
+        Exporta un checkpoint (.pth) ya entrenado a ONNX. No depende de que
+        haya un entrenamiento en curso — solo pide el checkpoint y dónde
+        guardar el .onnx, usando la arquitectura/num_classes configurados
+        actualmente en el panel (deben coincidir con los del checkpoint
+        elegido, o el resultado quedará con capas sin entrenar — se avisa
+        si eso pasa, no falla en silencio).
+        """
+        ckpt_path, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar checkpoint (.pth) a exportar", "",
+            "Checkpoints PyTorch (*.pth *.pt);;Todos (*)")
+        if not ckpt_path:
+            return
+        default_name = str(Path(ckpt_path).with_suffix(".onnx"))
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Guardar modelo ONNX como…", default_name, "ONNX (*.onnx)")
+        if not out_path:
+            return
+
+        arch = self._arch_combo.currentText()
+        num_classes = int(getattr(self, "_num_classes", 13))
+        num_points  = int(self._pts_spin.value())
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            worker = TrainingWorker({})
+            result = worker.export_onnx(arch, num_classes, ckpt_path, out_path, num_points)
+        except ImportError as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Falta una dependencia",
+                f"Exportar a ONNX requiere el paquete 'onnx' instalado "
+                f"(pip install onnx), además de PyTorch.\n\nError: {e}")
+            return
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Error exportando a ONNX",
+                f"No se pudo exportar el checkpoint:\n\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        msg = f"Modelo exportado a:\n{out_path}"
+        if result.get("missing") or result.get("unexpected"):
+            msg += (f"\n\nAVISO: el checkpoint no calzó del todo con la "
+                   f"arquitectura '{arch}' / {num_classes} clases configuradas — "
+                   f"{len(result['missing'])} capa(s) quedaron sin entrenar "
+                   f"(pesos aleatorios) en el modelo exportado. Revisa que la "
+                   f"arquitectura y el número de clases del panel coincidan "
+                   f"con los del checkpoint elegido.")
+        if result.get("note"):
+            msg += f"\n\n{result['note']}"
+        QMessageBox.information(self, "Exportación ONNX", msg)
+
     def _browse_data(self):
         d = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta del dataset")
         if d:
@@ -1212,7 +1481,8 @@ class TrainingPanel(QWidget):
             "pts":         self._pts_spin.value(),
             "num_classes": getattr(self, '_num_classes', 13),
             "class_names": getattr(self, '_class_names', []),
-            "resume_from": getattr(self, '_resume_path', None),
+            "resume_from":   getattr(self, '_resume_path', None),
+            "finetune_from": getattr(self, '_finetune_path', None),
         }
 
         self._log.clear()

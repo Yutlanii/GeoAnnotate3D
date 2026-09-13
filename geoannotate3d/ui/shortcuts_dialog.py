@@ -12,7 +12,7 @@ De paso, construir esta lista encontró 2 bugs reales: `DiscTool` (tecla
 "V") y `SphereSelectTool` (tecla "R") colisionaban con los atajos de
 cámara (V=vista cenital, R=reset cámara), que se comprueban ANTES que
 el mapa de herramientas en `keyPressEvent` — esas 2 herramientas nunca
-respondían a su tecla. Reasignadas a "D" y "H" (ver NOTES_CLAUDE.md).
+respondían a su tecla. Reasignadas a "D" y "H".
 """
 from __future__ import annotations
 from PyQt5.QtWidgets import (

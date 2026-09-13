@@ -189,9 +189,28 @@ class TileGridWidget(QWidget):
         show_txt = c >= 22
         show_pct = c >= 36
 
+        # BUG REAL ENCONTRADO (2026-09-09, confirmado con captura real —
+        # ver skill de rediseño de este panel): el tamaño de fuente escalaba
+        # como `c - 18` sin límite, así que en celdas grandes (cerca de
+        # CELL_MAX=56px) el texto salía a ~38px de alto — mucho más ANCHO
+        # que la celda para strings de 3-4 caracteres ("100%", "2,0") — el
+        # texto se desbordaba sobre las celdas vecinas y quedaba ilegible
+        # (números superpuestos). Fix: elegir el tamaño de fuente más
+        # grande que quepa de verdad dentro de la celda (con margen),
+        # medido con QFontMetrics contra el string MÁS ANCHO posible
+        # ("100%"), no una fórmula lineal ciega al ancho real del texto.
         if show_txt:
             f = QFont()
-            f.setPixelSize(max(8, c - 18))
+            widest = "100%"
+            max_w  = c - 6   # margen de ~3px por lado
+            size   = min(16, c - 8)   # techo razonable, nunca gigante
+            while size > 6:
+                f.setPixelSize(size)
+                fm = QFontMetrics(f)
+                if fm.horizontalAdvance(widest) <= max_w and fm.height() <= c - 2:
+                    break
+                size -= 1
+            f.setPixelSize(max(6, size))
             p.setFont(f)
 
         for tile in self._tm.tiles:
@@ -215,7 +234,14 @@ class TileGridWidget(QWidget):
                      QColor(TEXT_DIM) if tile.labeled_pct > 0 else
                      QColor(TEXT_MUTE))
                 p.setPen(tc)
+                # Clip explícito al rect de la celda: aunque el tamaño ya
+                # se eligió para caber, esto es una segunda barrera de
+                # seguridad — nunca más debería poder pintarse texto de
+                # una celda encima de la vecina, pase lo que pase.
+                p.save()
+                p.setClipRect(rect)
                 p.drawText(rect, Qt.AlignCenter, txt)
+                p.restore()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +290,38 @@ class TilePanel(QWidget):
             f"QPushButton:hover{{border-color:{ACCENT_BORDER};background:{ACCENT_SOFT};}}"
             f"QPushButton:checked{{background:{ACCENT_SOFT};border-color:{ACCENT};}}")
         return b
+
+    def _icon_text_btn(self, icon_name: str, text: str, tooltip: str,
+                       checkable: bool = False) -> QPushButton:
+        """
+        Botón icono + texto corto — REDISEÑO (2026-09-09): antes "modo de
+        vista", "cámara" y "modo de edición del grid" eran filas de
+        botones SOLO-ICONO (28×26px, sin texto) — había que pasar el
+        mouse y esperar el tooltip para saber qué hacía cada uno
+        (reportado como "no intuitivo", "no se sabe cómo volver a la
+        vista general/poner densidad máxima/vista cenital"). Este botón
+        SIEMPRE muestra icono + una palabra corta, el tooltip queda solo
+        como refuerzo (atajo de teclado, explicación más larga).
+        """
+        b = QPushButton(f"  {text}")
+        b.setIcon(qicon(icon_name, TEXT_DIM))
+        b.setIconSize(QSize(14, 14))
+        b.setFixedHeight(28)
+        b.setCheckable(checkable)
+        b.setToolTip(tooltip)
+        b.setStyleSheet(
+            f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};border-radius:4px;"
+            f"color:{TEXT_DIM};font-size:10px;font-weight:600;padding:0 6px;text-align:left;}}"
+            f"QPushButton:hover{{border-color:{ACCENT_BORDER};background:{ACCENT_SOFT};color:{ACCENT_STRONG};}}"
+            f"QPushButton:checked{{background:{ACCENT_SOFT};border-color:{ACCENT};color:{ACCENT_STRONG};}}")
+        return b
+
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color:{TEXT_MUTE};font-size:9.5px;font-weight:700;"
+            f"letter-spacing:0.4px;background:transparent;margin-top:2px;")
+        return lbl
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -344,14 +402,21 @@ class TilePanel(QWidget):
             f"color:{TEXT_MUTE}; font-size:12px; font-weight:700;")
         top.addWidget(self._mode_lbl, 1)
 
-        self._exit_btn = QPushButton("  Vista global")
-        self._exit_btn.setIcon(qicon("box-arrow-left", TEXT_DIM))
-        self._exit_btn.setFixedHeight(24)
+        # REDISEÑO: antes un botón "Vista global" con borde sutil, mismo
+        # peso visual que cualquier otro botón secundario — la acción más
+        # importante para "salir de un tile" pasaba desapercibida
+        # (reportado: "no se sabe bien cómo regresar a la vista completa").
+        # Ahora, mientras HAY un tile activo, se pinta con fondo de acento
+        # sólido (mismo tratamiento que "Cargar nube" en el estado vacío)
+        # para que se note de inmediato que es LA acción para volver.
+        self._exit_btn = QPushButton("  ← Volver a vista general")
+        self._exit_btn.setIcon(qicon("box-arrow-left", "#ffffff"))
+        self._exit_btn.setFixedHeight(26)
         self._exit_btn.setStyleSheet(
-            f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};"
-            f"border-radius:3px;color:{TEXT_DIM};font-size:10.5px;font-weight:600;padding:2px 10px;}}"
-            f"QPushButton:hover{{border-color:{ACCENT};color:{ACCENT_STRONG};background:{ACCENT_SOFT};}}"
-            f"QPushButton:disabled{{color:{TEXT_MUTE};border-color:{BORDER_SOFT};}}")
+            f"QPushButton{{background:{ACCENT};border:1px solid {ACCENT};"
+            f"border-radius:4px;color:#ffffff;font-size:10.5px;font-weight:700;padding:2px 10px;}}"
+            f"QPushButton:hover{{background:{ACCENT_STRONG};border-color:{ACCENT_STRONG};}}"
+            f"QPushButton:disabled{{background:{SURFACE};color:{TEXT_MUTE};border-color:{BORDER_SOFT};}}")
         self._exit_btn.setEnabled(False)
         self._exit_btn.clicked.connect(self._on_exit_clicked)
         top.addWidget(self._exit_btn)
@@ -417,38 +482,42 @@ class TilePanel(QWidget):
         divider.setStyleSheet(f"background:{BORDER_SOFT};max-height:1px;")
         tb_l.addWidget(divider)
 
-        # Fila 2: modo de vista (iconos) + stats
+        # Fila 2: modo de vista — REDISEÑO: antes 3 iconos sueltos sin texto
+        # ("Sparse"/"Full"/"Volar" solo se sabían por tooltip). Ahora cada
+        # botón dice qué hace ("Disperso"/"Densidad máx."/"Volar"), y el
+        # nombre interno ya no dice "Full" (ambiguo) sino que el texto
+        # visible es explícito sobre qué es "máxima densidad".
+        tb_l.addWidget(self._section_label("MODO DE VISTA"))
         mode_row = QHBoxLayout(); mode_row.setSpacing(4)
         self._mode_btns = {}
-        for mode, icon_name, tip in [
-            ("Sparse", "grid-3x3",   "Vista dispersa — rápida, ideal para nubes enormes"),
-            ("Full",   "layers",    "Vista completa — densidad máxima disponible"),
-            ("Volar",  "compass",   "Modo vuelo — cámara libre WASD  [F]"),
+        for mode, icon_name, label, tip in [
+            ("Sparse", "grid-3x3",   "Disperso",     "Vista dispersa — rápida, ideal para nubes enormes.\nMenos puntos en pantalla, no crece automáticamente."),
+            ("Full",   "layers",    "Densidad máx.", "Vista completa — carga progresivamente hasta la\nmáxima densidad disponible del tile/nube."),
+            ("Volar",  "controller","Volar",         "Modo vuelo: cámara libre estilo videojuego (WASD +\nmouse para mirar).  Atajo: F"),
         ]:
-            b = self._icon_btn(icon_name, tip, checkable=True)
+            b = self._icon_text_btn(icon_name, label, tip, checkable=True)
             b.clicked.connect(lambda checked, m=mode: self._on_mode_btn(m))
-            mode_row.addWidget(b)
+            mode_row.addWidget(b, 1)
             self._mode_btns[mode] = b
-        mode_row.addStretch()
+        tb_l.addLayout(mode_row)
 
         self._stats_lbl = QLabel("–")
         self._stats_lbl.setStyleSheet(f"color:{TEXT_MUTE};font-size:10.5px;background:transparent;")
-        self._stats_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        mode_row.addWidget(self._stats_lbl)
-        tb_l.addLayout(mode_row)
+        self._stats_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        tb_l.addWidget(self._stats_lbl)
 
-        # Fila 3: cámara
+        # Fila 3: cámara — mismo rediseño: texto explícito en vez de solo icono.
+        tb_l.addWidget(self._section_label("CÁMARA"))
         cam_row = QHBoxLayout(); cam_row.setSpacing(4)
-        self._btn_top   = self._icon_btn("arrow-bar-up",      "Vista desde arriba (Z)  [V]")
-        self._btn_side  = self._icon_btn("arrow-bar-right",   "Vista lateral (desde Y)  [Y]")
-        self._btn_reset = self._icon_btn("arrows-fullscreen", "Encuadrar nube completa  [R]")
+        self._btn_top   = self._icon_text_btn("arrow-bar-up",      "Cenital",   "Vista desde arriba (mirando hacia abajo en Z).  Atajo: V")
+        self._btn_side  = self._icon_text_btn("arrow-bar-right",   "Lateral",   "Vista lateral (desde el eje Y).  Atajo: Y")
+        self._btn_reset = self._icon_text_btn("arrows-fullscreen", "Encuadrar", "Encuadra/centra la cámara para ver la nube completa.  Atajo: R")
         self._btn_top.clicked.connect(lambda: self._emit_view_cmd("top"))
         self._btn_side.clicked.connect(lambda: self._emit_view_cmd("side"))
         self._btn_reset.clicked.connect(lambda: self._emit_view_cmd("reset"))
-        cam_row.addWidget(self._btn_top)
-        cam_row.addWidget(self._btn_side)
-        cam_row.addWidget(self._btn_reset)
-        cam_row.addStretch()
+        cam_row.addWidget(self._btn_top, 1)
+        cam_row.addWidget(self._btn_side, 1)
+        cam_row.addWidget(self._btn_reset, 1)
         tb_l.addLayout(cam_row)
 
         root.addWidget(tb)
@@ -603,22 +672,42 @@ class TilePanel(QWidget):
         hdr.addWidget(_ic); hdr.addWidget(_sec)
         hdr.addStretch()
         reset_btn = QPushButton("Reset")
-        reset_btn.setFixedSize(50, 22)
+        # FIX: con setFixedSize(50, 22) el texto salía cortado — mismo tipo
+        # de desajuste de redondeo de fuente que ya afectó a otros botones
+        # (ver CHANGELOG, "Bug de fuentes Qt"): a 10.5px/600 weight, "Reset"
+        # más el padding del QPushButton no entra en 50px de ancho. Se
+        # ensancha un poco y se deja padding horizontal explícito en vez de
+        # depender de un ancho fijo calculado a ojo.
+        reset_btn.setFixedHeight(22)
+        reset_btn.setMinimumWidth(64)
         reset_btn.setStyleSheet(
             f"QPushButton{{background:{SURFACE_2};border:1px solid {BORDER};"
-            f"border-radius:4px;color:{TEXT_DIM};font-size:10.5px;font-weight:600;}}"
+            f"border-radius:4px;color:{TEXT_DIM};font-size:10.5px;font-weight:600;"
+            f"padding:0 8px;}}"
             f"QPushButton:hover{{border-color:{ACCENT};color:{ACCENT_STRONG};}}")
         reset_btn.clicked.connect(self._reset_transform)
         hdr.addWidget(reset_btn)
         tr_l.addLayout(hdr)
 
-        # Botones de modo — iconos: navegar / mover grid / rotar
+        # Botones de modo — REDISEÑO: antes 3 iconos sueltos ("compass",
+        # "arrows-move", "arrow-repeat") sin texto — y "compass" colisionaba
+        # visualmente con el botón de "Volar" de más arriba (mismo icono,
+        # significado distinto), reforzando la confusión. Ahora cada botón
+        # dice qué hace, y "Volar" ya usa un icono distinto (controller).
+        tr_l.addWidget(self._section_label("QUÉ HACE EL MOUSE SOBRE LA NUBE"))
         mode_row = QHBoxLayout(); mode_row.setSpacing(4)
-        self._btn_navigate = self._icon_btn(
-            "compass", "Modo navegación normal\nRueda = zoom · Clic+arrastrar = girar · "
-                       "Ctrl+arrastrar = panear", checkable=True)
-        self._btn_move   = self._icon_btn("arrows-move",       "Mover el grid con el mouse", checkable=True)
-        self._btn_rotate = self._icon_btn("arrow-repeat",      "Rotar el grid con el mouse", checkable=True)
+        self._btn_navigate = self._icon_text_btn(
+            "compass", "Navegar", "Modo normal: el mouse mueve la CÁMARA.\n"
+                       "Rueda = zoom · Clic+arrastrar = girar · Ctrl+arrastrar = panear",
+            checkable=True)
+        self._btn_move   = self._icon_text_btn(
+            "arrows-move", "Mover grid",
+            "El mouse MUEVE el grid de tiles (en vez de la cámara) —\n"
+            "arrastra para reposicionarlo sobre la nube.", checkable=True)
+        self._btn_rotate = self._icon_text_btn(
+            "arrow-repeat", "Rotar grid",
+            "El mouse ROTA el grid de tiles (en vez de la cámara) —\n"
+            "arrastra para girarlo.", checkable=True)
         self._btn_navigate.setChecked(True)   # activo por defecto
 
         for btn, mode in [
@@ -627,8 +716,7 @@ class TilePanel(QWidget):
             (self._btn_rotate,  "rotate")
         ]:
             btn.clicked.connect(lambda c, m=mode: self._on_edit_mode(m))
-            mode_row.addWidget(btn)
-        mode_row.addStretch()
+            mode_row.addWidget(btn, 1)
         tr_l.addLayout(mode_row)
 
         # Spinboxes

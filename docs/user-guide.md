@@ -11,13 +11,16 @@ The header bar (top) shows the app name, the loaded file and point count, its CR
 **Loading.** `Proyecto → Nuevo proyecto` (`Ctrl+N`) or drag-and-drop a file onto the window. Supported formats: `.las`, `.laz`, `.e57`, `.ply`, `.pcd`, `.xyz`, `.txt`, `.csv`, `.asc`, `.pts`, `.npy`, plus GeoAnnotate3D's own `.ga3d_bin` cache format for very large clouds.
 
 - If the file has RGB, it opens in **RGB** color mode; otherwise it opens colored by **elevation**. You can switch color mode from the tool panel's **VISUALIZACIÓN** section at any time (RGB / Elevation / Intensity / Annotation).
-- `.laz` files need a LAZ decompression backend (`lazrs` or `laszip`, both installable via `pip install "laspy[lazrs]"`). If a file fails to open with an error mentioning EVLR or header length, the file's header itself may be non-standard — try re-exporting it with CloudCompare, PDAL, or `lastools` (`lasinfo`/`las2las`) and reload.
+- `.laz` files need a LAZ decompression backend (`lazrs` or `laszip`, both installable via `pip install "laspy[lazrs]"`). If a file fails to open with an error mentioning EVLR or header length, the file's header itself may be non-standard — try re-exporting it with CloudCompare, PDAL, or `lastools` (`lasinfo`/`las2las`) and reload. When `lazrs` is available, decompression explicitly uses its multi-threaded backend for faster loading.
+- **COPC** (`.copc.laz`, Cloud Optimized Point Cloud) files are detected and loaded via a dedicated code path (their internal point storage isn't compatible with a regular LAZ streaming reader) — the file info shows "COPC" for these. GeoAnnotate3D loads the full point set at once; it does not yet use COPC's internal spatial index for partial/streamed loading of very large files.
 
 **Tiles.** For clouds too dense to comfortably navigate as a whole, the **Overview** panel lets you configure a tile grid:
 
 - **Tamaño de tile** — width/height of each tile in meters.
 - The grid preview shows one cell per tile; percentages indicate how much of that tile is already labeled.
-- **TRANSFORM** — drag to move the grid, or use the Offset X/Y and Rotación fields to align it precisely with the cloud's footprint (useful when the cloud isn't axis-aligned).
+- **MODO DE VISTA** — labeled buttons **Disperso** (fast, low density, good for huge clouds), **Densidad máx.** (loads progressively up to the finest detail available) and **Volar** (free WASD camera, key `F`).
+- **CÁMARA** — **Cenital** (top-down, key `V`), **Lateral** (side view, key `Y`), **Encuadrar** (fit the whole cloud in view, key `R`).
+- **TRANSFORM** — three labeled mouse modes decide what dragging on the canvas does: **Navegar** (normal camera controls — the default), **Mover grid** and **Rotar grid** (drag to reposition/rotate the tile grid itself instead of the camera). Use the Offset X/Y and Rotación fields for precise numeric alignment, or **Reset** to zero them out.
 - Click a tile to enter **tile mode** (loads just that tile at full density); `Escape` or the **← Vista global** button returns to Overview.
 - Filters below the grid (**Sin anotar / Parcial / Completo**) let you jump straight to tiles that still need work.
 - Hover any tile (even at small grid-cell sizes, where inline text doesn't fit) to see a tooltip with its coordinates, labeled percentage, and whether it's the currently active tile.
@@ -43,6 +46,13 @@ Two independent, automatic methods to reduce manual labeling. Neither depends on
 
 **Suelo por simulación de tela (CSF)** — Cloth Simulation Filter, the same ground-detection algorithm used by CloudCompare: simulates a cloth falling onto the inverted point cloud to find the ground surface. Requires `pip install cloth-simulation-filter`. Pick the target class and cloth resolution (smaller = more detail, slower), then **Detectar suelo (CSF)**.
 
+**Limpiar ruido (SOR)** — Statistical Outlier Removal, the same noise-detection algorithm used by CloudCompare/PCL: for each point, compares its mean distance to its `k` nearest neighbors against the cloud's overall average — points that are abnormally isolated are flagged as sensor noise. Adjust **Vecinos (k)** and **Sensibilidad** (lower = more aggressive), run **Detectar ruido (SOR)**, then confirm to delete the flagged points (undoable with `Ctrl+Z`, same as any other annotation).
+
+**QA de anotación** — two more diagnostic tools once you've labeled at least part of the cloud:
+
+- **Suavizar etiquetas** — each labeled point recalculates its class as the majority vote among its `k` nearest neighbors, cleaning up noisy boundaries between classes (e.g. a stray brush stroke that bled one class into another). It never touches unlabeled points, never touches deleted points, and never uses them as votes either — a point with no real neighbors of a different class simply keeps its current label.
+- **Detectar clusters aislados** — for each class, groups its points by spatial connectivity and reports clusters smaller than **Máx. puntos/cluster** — candidates for an accidental click or other annotation error. Purely diagnostic: nothing is changed automatically, you review the report and fix flagged spots by hand (Pincel/Esfera/eliminar puntos).
+
 ---
 
 ## 3. Etiquetar (Labeling)
@@ -56,14 +66,24 @@ Two independent, automatic methods to reduce manual labeling. Neither depends on
 | Pincel | `B` | Spherical brush; `Ctrl`+drag paints a continuous stroke. Radius, stroke density, and disc thickness are adjustable; scroll wheel resizes it live. |
 | Disco | `D` | A 3D disc oriented to the local surface; `Ctrl`+click places it. |
 | Region Growing | `G` | `Ctrl`+click a seed point; grows outward through connected, similarly-colored geometry. |
+| Ajustar plano | `P` | `Ctrl`+click fits the dominant plane inside a search radius (RANSAC — same idea as CloudCompare's "RANSAC Shape Detection") and labels only the points that turn out to be flat; non-planar points in the same radius (a chimney, a railing) are left untouched. A live circle shows the search radius as you move the mouse; after fitting, a cyan outline shows exactly what was detected as planar. Radius and tolerance (how far a point can be from the plane and still count) are adjustable in the tool's options. |
 | Polígono | `L` | Draw a 2D/3D polygon; everything inside gets the active class. |
 | Caja | `X` | Box selection. |
 | Esfera | `H` | `Ctrl`+click for an instant spherical selection (vs. Pincel's continuous stroke). |
 | Corte Z | `C` | Slice/cross-section selection by height. |
 | Pick | `I` | Sample the class of the point under the cursor (to check what's already labeled). |
-| Medir | `M` | Measure distances in the scene. |
+| Medir | `M` | Measure distances in the scene — click point A, click point B. The measurement stays anchored in the scene (see **Marcadores persistentes** below). `Ctrl`+click an *existing* measurement to edit its color/line width or delete it. |
+| Etiqueta 3D | `N` | `Ctrl`+click to place a short text label anchored at that point — a note that stays visible and is saved with the project. `Ctrl`+click an *existing* label instead of empty space to edit its text, font size, and color, or delete it. |
+| Polilínea | `K` | `Ctrl`+click adds a vertex, `Enter` finishes and saves it, `Backspace` removes the last vertex, `Escape` cancels without saving. `Ctrl`+click an *existing* polyline instead of empty space to edit its color/line width or delete it. Digitizes an open, multi-vertex line — a road/utility centerline, a talus edge — something a single 2-point measurement or a closed polygon can't represent. |
+| Perfil | `O` | `Ctrl`+click A, click B — opens a 2D cross-section view of the strip of cloud around that line (distance along the line vs. elevation), with adjustable strip width and vertical exaggeration. Useful for checking slopes, power lines, or road sections without rotating the 3D camera to an awkward side angle. |
 
 `E` toggles **erase mode** on the active tool — clears the class back to unlabeled (0), it does not remove the point. `Supr` (Delete) toggles **delete mode** instead — mutually exclusive with erase mode — which removes the selected points from the cloud entirely (useful for cleaning up sensor noise or stray points); this works with *any* of the selection tools above, not just one dedicated tool. Deleted points are excluded from every export and are undoable like any other annotation (`Ctrl+Z`). `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo. `Ctrl+clic` on the canvas is the common "commit" gesture for the click-based tools.
+
+**Marcadores persistentes (etiquetas, medidas y polilíneas en 3D).** Unlike the selection tools above, "Medir", "Etiqueta 3D" and "Polilínea" don't change any point's class — they leave a permanent visual marker (a small sphere + floating text, a line between two points for a measurement, or a connected multi-vertex line for a polyline) anchored in 3D space, saved with the project (`.geoa3d`) so they're still there next time you open it. `Ctrl`+click any existing marker (instead of empty space) to edit or delete it — every marker kind supports this. The floating text is always rendered on top of the point cloud so it can't get hidden behind it as the camera moves. Use them for field notes, QA remarks, digitizing a centerline, or documenting a distance for a report, independent of the classification itself.
+
+**Perfil (vertical cross-section).** Trace a line A→B with the **Perfil** tool and a separate window opens showing the strip of cloud around that line unrolled into 2D: horizontal axis is distance along the line, vertical axis is elevation, colored by classification when available (with a legend of only the classes actually present in that strip) or by height otherwise. Drag to pan, scroll to zoom, hover to read the exact distance/elevation of the nearest point, and adjust vertical exaggeration to see subtle elevation changes over a long horizontal run — the strip width is adjustable in the tool's options section. **Exportar CSV** saves the extracted points (distance, elevation, and RGB if colored by class) to a file for further analysis outside the app. Doesn't select or change anything in the 3D scene; it's purely an inspection view, and reopens the same window for each new A→B line you trace instead of stacking windows.
+
+**Caja de recorte (clip box).** In the tool panel's **VISUALIZACIÓN** section, the **Caja de recorte** toggle overlays a draggable 3D box — drag its faces to isolate a volume, everything outside it is temporarily hidden. It's purely visual (nothing is deleted or reclassified): turn it off to see the full cloud again exactly as before. Useful for inspecting the inside of a structure or working in a crowded scene without other tools' selections reaching hidden geometry — the annotation tools still only ever act on the visible/queried points as usual.
 
 **Reference layers** (rail entry below Inferir, or accessible while labeling): overlay georeferenced orthomosaics (`.tif`) or vector layers (`.shp`, `.geojson`, `.gpkg`, `.kml`, `.dxf`) with real-world coordinates to guide labeling. Lower the point cloud's own opacity from this panel to see an underlying raster more clearly, and use **Vista cenital** to align the camera top-down.
 
@@ -79,6 +99,8 @@ Pick one or more target architectures — **RandLA-Net**, **PointNet++**, **KPCo
 
 The split between train/val/test is spatial (separate geographic blocks) to avoid data leakage between splits.
 
+**Growing one dataset from several point clouds**: point **Carpeta de salida** at the *same* folder you already exported to, from a different (or newly annotated) point cloud, and GeoAnnotate3D adds to that dataset instead of overwriting it. Every tile file is named with a short tag derived from its source cloud, so tiles from different clouds never collide, and the classified `.las` gets a disambiguated name too if needed. `dataset.json` is merged rather than replaced: `n_tiles_total`, the train/val/test tile lists, `per_class_counts` and `class_weights` all accumulate across every export made into that folder, and `source_files` lists every cloud that contributed to it. This only makes sense across exports that share the same class schema (the same GeoAnnotate3D project) — mixing schemas writes a `schema_warning` field into `dataset.json` so you notice, but doesn't stop the export.
+
 ---
 
 ## 5. Entrenar
@@ -87,7 +109,11 @@ Three architectures are implemented directly in the app (no external training fr
 
 **Resuming a training run.** Use the **Reanudar** row to pick a previously saved checkpoint (`.pth`) — training continues from that epoch with the optimizer and learning-rate scheduler state restored, not just the model weights, so it behaves as if it had never stopped. Safe to close the app mid-run and resume later.
 
+**Fine-tuning from an external checkpoint.** The **Fine-tuning** row is different from **Reanudar**: it starts a *new* training run (epoch 1, fresh optimizer/scheduler) but loads its starting weights from another checkpoint instead of random initialization — layer-by-layer, matching by name *and* shape, skipping (and randomly re-initializing) whatever doesn't match. In practice that means the classification head gets reset when the checkpoint came from a project with a different number of classes, while the rest of the network keeps what it already learned. This is meant for continuing to learn from a model this same app already trained on a different project/dataset; a checkpoint from the original third-party RandLA-Net/PointNet++/KPConv repositories won't have matching layer names (these are from-scratch re-implementations) so it would load 0 tensors — the log tells you exactly how many tensors were reused vs. reset either way, instead of silently pretending it helped.
+
 **Per-class report.** When training finishes, alongside `best_model.pth` you get `class_report.json` and `class_report.txt` in the output folder: precision, recall, and IoU for *each* class individually (not just the aggregate mIoU), plus how many points supported each class — useful for spotting which classes need more labeled data.
+
+**Exportar a ONNX.** Converts an already-trained checkpoint to ONNX format, to run inference outside this app (another pipeline, an edge device, a server without PyTorch). Independent of any training in progress — just pick a `.pth` and where to save the `.onnx`; architecture and class count come from the panel's current settings, which must match the checkpoint you're exporting (a mismatch is reported, not silently ignored). RandLA-Net's forward pass uses a random point subsample that ONNX has no equivalent operator for — its exported graph uses a fixed subsample instead, noted in the result dialog; PointNet++ and KPConv export without that caveat. Requires the `onnx` Python package installed in addition to PyTorch.
 
 ---
 

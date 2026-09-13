@@ -49,11 +49,16 @@ class AnnotationOp:
     Una operación atómica de anotación.
 
     Guardamos los índices afectados y las etiquetas ANTERIORES (para undo).
-    Las etiquetas NUEVAS no necesitan guardarse — se reaplican con class_id.
+    Las etiquetas NUEVAS no necesitan guardarse — se reaplican con class_id,
+    EXCEPTO cuando new_labels no es None (ver annotate_bulk): operaciones
+    donde cada índice recibe una clase DISTINTA (suavizado por mayoría de
+    vecinos, ajuste de plano RANSAC aplicado a varios objetos, etc.) no
+    pueden representarse con un único class_id escalar.
     """
     indices:       np.ndarray   # (K,) int32 — índices afectados
     prev_labels:   np.ndarray   # (K,) uint8 — etiquetas antes de la op
-    new_class_id:  int          # clase que se aplicó
+    new_class_id:  int          # clase que se aplicó (uniforme) — -1 si new_labels no es None
+    new_labels:    Optional[np.ndarray] = None  # (K,) uint8 — solo para annotate_bulk
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +151,38 @@ class LabelStore(QObject):
         self.labels_changed.emit(idx, np.full(len(idx), class_id, np.uint8))
         self._request_stats_update()
 
+    def annotate_bulk(self, indices: np.ndarray, new_labels: np.ndarray) -> None:
+        """
+        Como annotate(), pero cada índice puede recibir una clase DISTINTA —
+        para operaciones que calculan la clase por punto (suavizado por
+        mayoría de vecinos, remapeo tras ajuste de plano, etc.) en vez de
+        aplicar una sola clase activa a toda la selección.
+
+        indices y new_labels deben tener el mismo largo (new_labels[i] es
+        la clase nueva de indices[i]). Mismo undo/redo, autosave y stats
+        que annotate() — es la misma maquinaria, solo que AnnotationOp
+        guarda el array de etiquetas nuevas en vez de un class_id único.
+        """
+        if self._labels is None or len(indices) == 0:
+            return
+        idx = np.ascontiguousarray(indices, dtype=np.int32)
+        new_lbl = np.ascontiguousarray(new_labels, dtype=np.uint8)
+        if len(new_lbl) != len(idx):
+            raise ValueError(
+                f"annotate_bulk: indices ({len(idx)}) y new_labels "
+                f"({len(new_lbl)}) deben tener el mismo largo")
+        prev = self._labels[idx].copy()
+
+        op = AnnotationOp(indices=idx, prev_labels=prev,
+                          new_class_id=-1, new_labels=new_lbl.copy())
+        self._undo_stack.append(op)
+        self._redo_stack.clear()
+
+        self._labels[idx] = new_lbl
+
+        self.labels_changed.emit(idx, new_lbl)
+        self._request_stats_update()
+
     def _request_stats_update(self) -> None:
         """Coalesce múltiples annotate() seguidos en una sola stats_changed."""
         if not self._stats_pending:
@@ -183,9 +220,13 @@ class LabelStore(QObject):
             return False
         op = self._redo_stack.pop()
         self._undo_stack.append(op)
-        self._labels[op.indices] = np.uint8(op.new_class_id)
-        self.labels_changed.emit(op.indices,
-                                 np.full(len(op.indices), op.new_class_id, np.uint8))
+        if op.new_labels is not None:
+            self._labels[op.indices] = op.new_labels
+            self.labels_changed.emit(op.indices, op.new_labels)
+        else:
+            self._labels[op.indices] = np.uint8(op.new_class_id)
+            self.labels_changed.emit(op.indices,
+                                     np.full(len(op.indices), op.new_class_id, np.uint8))
         self.stats_changed.emit()
         return True
 

@@ -127,9 +127,14 @@ Everything needed is already inside the installer — there's nothing to downloa
 
 ---
 
-## Demo
+## Try it now
 
-[![Demo Video](docs/images/video-thumbnail.png)](https://www.youtube.com/watch?v=YOUR_VIDEO_ID)
+Don't have a LiDAR file handy? [`sample_data/`](sample_data/) includes real,
+manually-classified point clouds you can open right away (all CC BY 4.0): a
+large aerial scene (Autzen Stadium, ~10.6M points, 21 categories, COPC
+format) and 15 small ISPRS ground-filter benchmark scenes (binary
+ground/non-ground) — see [`sample_data/README.md`](sample_data/README.md)
+for details and attribution.
 
 ---
 
