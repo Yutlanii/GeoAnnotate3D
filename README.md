@@ -19,6 +19,22 @@ Visualize, annotate, train, and run inference on massive LiDAR point clouds in o
 
 ---
 
+## Screenshots
+
+![Point Cloud Loading](docs/images/screenshot-load.png)
+*Loading and visualization of massive point clouds*
+
+![Annotation](docs/images/screenshot-annotation.png)
+*Labeling with overlaid orthomosaics*
+
+![Training](docs/images/screenshot-training.png)
+*Integrated training with mIoU monitoring*
+
+![Inference](docs/images/screenshot-inference.png)
+*Inference on the full point cloud*
+
+---
+
 ## About
 
 GeoAnnotate3D is a free, offline desktop application that integrates the complete workflow for LiDAR point cloud annotation and deep learning model training in a single environment. It allows users to load, visualize, annotate, export, train, and run inference with custom classification models on massive point clouds, without relying on commercial licenses or cloud services.
@@ -135,22 +151,6 @@ large aerial scene (Autzen Stadium, ~10.6M points, 21 categories, COPC
 format) and 15 small ISPRS ground-filter benchmark scenes (binary
 ground/non-ground) — see [`sample_data/README.md`](sample_data/README.md)
 for details and attribution.
-
----
-
-## Screenshots
-
-![Point Cloud Loading](docs/images/screenshot-load.png)
-*Loading and visualization of massive point clouds*
-
-![Annotation](docs/images/screenshot-annotation.png)
-*Labeling with overlaid orthomosaics*
-
-![Training](docs/images/screenshot-training.png)
-*Integrated training with mIoU monitoring*
-
-![Inference](docs/images/screenshot-inference.png)
-*Inference on the full point cloud*
 
 ---
 
