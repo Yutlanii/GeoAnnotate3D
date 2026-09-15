@@ -52,35 +52,35 @@ python main.py
 python main.py path/to/cloud.laz
 ```
 
-On first launch you'll see a welcome/tutorial dialog describing the 6-step workflow. You can reopen it any time from **Ayuda → Bienvenida / Tutorial** in the header bar.
+On first launch you'll see a welcome/tutorial dialog describing the 6-step workflow. You can reopen it any time from **Help → Welcome / Tutorial** (`Ayuda → Bienvenida / Tutorial`) in the header bar.
 
 ## 3. Load a point cloud
 
-From the **Nube** step (the first item in the left rail): **Proyecto → Nuevo proyecto** (`Ctrl+N`), then pick a `.las`, `.laz`, `.e57`, `.ply`, or `.npy` file.
+From the **Point Cloud** step (`Nube`, the first item in the left rail): **Project → New Project** (`Proyecto → Nuevo proyecto`, `Ctrl+N`), then pick a `.las`, `.laz`, `.e57`, `.ply`, or `.npy` file.
 
 - If the cloud has RGB data, it opens in RGB color mode automatically; otherwise it opens in elevation mode.
 - For clouds bigger than roughly 20-30M points, the **Overview** panel lets you configure a tile grid (drag/rotate/resize it over the footprint) so you work tile-by-tile instead of loading everything into the 3D view at once.
 
 ## 4. Pre-classify (optional but recommended)
 
-Move to the **Pre-clasificar** step. Two independent tools help you avoid hand-labeling the obvious classes:
+Move to the **Preclassify** step (`Pre-clasificar`). Two independent tools help you avoid hand-labeling the obvious classes:
 
 - **CSF (Cloth Simulation Filter)** — detects the ground automatically.
-- **Clasificar por altura (AGL)** — assigns a class to each height-above-ground range (e.g. 0-0.3m → Ground, 0.3-2m → Low vegetation...). Click **Configurar rangos…** to edit those ranges in a table; adjusting one boundary automatically keeps neighboring ranges continuous.
+- **Classify by height / AGL** (`Clasificar por altura (AGL)`) — assigns a class to each height-above-ground range (e.g. 0-0.3m → Ground, 0.3-2m → Low vegetation...). Click **Configure ranges…** (`Configurar rangos…`) to edit those ranges in a table; adjusting one boundary automatically keeps neighboring ranges continuous.
 
 ## 5. Label manually
 
-In the **Etiquetar** step, pick a class (`1`-`9` or click it in the **CLASES** list) and a tool from the right panel: Pincel (brush, `B`), Disco (`D`), Region Growing (`G`), Polígono (`L`), Caja (`X`), Esfera (`H`), Corte Z (`C`), Pick (`I`), Medir (`M`). `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo. See **Ayuda → Atajos de teclado** (`F1`) for the full list.
+In the **Label** step (`Etiquetar`), pick a class (`1`-`9` or click it in the **Classes** (`CLASES`) list) and a tool from the right panel: Brush (`Pincel`, `B`), Disc (`Disco`, `D`), Region Growing (`G`), Polygon (`Polígono`, `L`), Box (`Caja`, `X`), Sphere (`Esfera`, `H`), Z-slice (`Corte Z`, `C`), Pick (`I`), Measure (`Medir`, `M`). `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo. See **Help → Keyboard Shortcuts** (`Ayuda → Atajos de teclado`, `F1`) for the full list.
 
 ## 6. Export a dataset
 
-In **Exportar**, pick a target architecture (RandLA-Net, PointNet++, or KPConv) — the export format is chosen automatically — and click **Exportar dataset**. You get a ready-to-train folder with an automatic spatial train/val/test split, plus an optional classified `.las` (with standard ASPRS codes if you check that box) for viewing in CloudCompare/QGIS.
+In **Export** (`Exportar`), pick a target architecture (RandLA-Net, PointNet++, or KPConv) — the export format is chosen automatically — and click **Export dataset** (`Exportar dataset`). You get a ready-to-train folder with an automatic spatial train/val/test split, plus an optional classified `.las` (with standard ASPRS codes if you check that box) for viewing in CloudCompare/QGIS.
 
 ## 7. Train and infer
 
-**Entrenar**: point it at the exported dataset folder, pick an architecture, and start training — it shows live loss/mIoU curves and a per-class report at the end. Training can be resumed from any saved checkpoint if interrupted.
+**Train** (`Entrenar`): point it at the exported dataset folder, pick an architecture, and start training — it shows live loss/mIoU curves and a per-class report at the end. Training can be resumed from any saved checkpoint if interrupted.
 
-**Inferir**: load a trained `.pth` model and run it on the current cloud, or use **batch inference** to process a whole folder of point clouds unattended.
+**Infer** (`Inferir`): load a trained `.pth` model and run it on the current cloud, or use **batch inference** to process a whole folder of point clouds unattended.
 
 ## Where to go next
 

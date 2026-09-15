@@ -24,7 +24,7 @@ Cloud) form.
 Use it to try GeoAnnotate3D immediately after cloning, without needing your
 own LiDAR data:
 
-1. `Proyecto → Nuevo proyecto` and pick this file (or drag it onto the window).
+1. **Project → New Project** (`Proyecto → Nuevo proyecto`) and pick this file (or drag it onto the window).
 2. It loads with real classification already present — GeoAnnotate3D will
    offer to import it directly as labels (auto-matched to a default class
    schema by keyword), so you can see a fully-labeled cloud right away.

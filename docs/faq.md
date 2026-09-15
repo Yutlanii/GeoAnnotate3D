@@ -27,7 +27,7 @@ No — training and inference both run on CPU, just slower. A CUDA-capable NVIDI
 **Which point cloud formats can I open?**
 `.las`, `.laz`, `.e57`, `.ply`, `.pcd`, `.xyz`, `.txt`, `.csv`, `.asc`, `.pts`, `.npy`, and GeoAnnotate3D's own `.ga3d_bin` cache format.
 
-**What does "Usar códigos de clasificación ASPRS estándar" actually do?**
+**What does "Use standard ASPRS classification codes" (`Usar códigos de clasificación ASPRS estándar`) actually do?**
 Your class schema is free text (whatever names you gave your classes), so by default the exported classified `.las` just writes your internal class IDs (0, 1, 2…) into the `classification` field — meaningless to other software. With this option checked, class names are matched by keyword (e.g. "suelo"/"ground" → code 2, "edificio"/"building" → code 6) to the ASPRS standard classification codes so the file opens correctly in CloudCompare, QGIS, or ArcGIS. Anything that doesn't match a known keyword gets a code in the 64-255 range, which the LAS 1.4 spec reserves for user-defined classes, so it never collides with a real standard code.
 
 **What's inside a `.geoa3d` project file?**
@@ -36,7 +36,7 @@ It's a ZIP containing `meta.json` (class schema, project metadata, stats) and `l
 ## Performance
 
 **My cloud has hundreds of millions of points — will it work?**
-Yes, that's the primary design target. Use the tile grid (**Nube** step) to split it into workable chunks instead of loading it all at once; very large clouds automatically switch to an out-of-core (memory-mapped) loading path. The brush and other annotation tools use an octree spatial index specifically so they stay fast on dense tiles.
+Yes, that's the primary design target. Use the tile grid (**Point Cloud** step, `Nube`) to split it into workable chunks instead of loading it all at once; very large clouds automatically switch to an out-of-core (memory-mapped) loading path. The brush and other annotation tools use an octree spatial index specifically so they stay fast on dense tiles.
 
 **Annotation feels slow on a specific tile.**
 Compile the native C extension once (`python core/build_extension.py` — needs a C compiler, see the installer instructions) — it gives roughly a 20x speedup on annotation and 3-8x on level-of-detail rendering. The app works without it, just slower.
@@ -47,7 +47,7 @@ Compile the native C extension once (`python core/build_extension.py` — needs 
 Check `~/.geoannotate3d/logs/crash.log` — this is where crash details are written even when no dialog is shown (some crashes happen inside native rendering code where showing a dialog would itself be unsafe). On the next launch after an unexpected close, GeoAnnotate3D shows a notice with a button to open that log folder directly. Attach `crash.log` when reporting an issue.
 
 **A keyboard shortcut doesn't seem to do anything.**
-Check **Ayuda → Atajos de teclado** (`F1`) for the current, accurate list — it's generated from the same code that handles the shortcuts, so it can't drift out of sync with reality.
+Check **Help → Keyboard Shortcuts** (`Ayuda → Atajos de teclado`, `F1`) for the current, accurate list — it's generated from the same code that handles the shortcuts, so it can't drift out of sync with reality.
 
 **My window layout / panel sizes reset.**
 This should no longer happen — window size, position, and the main panel split are saved on close and restored on the next launch. If you're on a build from before this was added, update to the latest version.
