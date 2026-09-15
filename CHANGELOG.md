@@ -6,11 +6,11 @@ All notable changes to GeoAnnotate3D are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
-- **Caja de recorte interactiva (clip box)** — a draggable 3D box widget that
+- **Interactive clip box (Caja de recorte)** — a draggable 3D box widget that
   isolates a volume of the point cloud for inspection or cleanup; purely
   visual (no data is modified), toggle in the tool panel's Visualización
   section.
-- **Etiquetas y medidas persistentes en 3D** — text labels and measurements
+- **Persistent 3D labels and measurements** — text labels and measurements
   now stay anchored in the scene and are saved with the project, instead of
   disappearing as soon as you measured something else. New "Etiqueta 3D"
   tool (key `N`) places a text label; `Ctrl`+click an existing one to edit
@@ -33,14 +33,14 @@ All notable changes to GeoAnnotate3D are documented here. Format loosely follows
   exaggeration, a hover readout of the nearest point's distance/elevation,
   and a CSV export button. For inspecting slopes, power lines, or road
   sections without rotating the 3D camera to an awkward angle.
-- **Suavizado de etiquetas por mayoría de vecinos** — post-processing pass
+- **Neighbor-majority label smoothing** — post-processing pass
   (Pre-clasificar panel) that cleans up noisy label boundaries by having each
   labeled point adopt the majority class among its k nearest neighbors.
   Never touches unlabeled or deleted points.
-- **Detección de clusters aislados (QA)** — reports small, spatially
+- **Isolated cluster detection (QA)** — reports small, spatially
   disconnected groups of a class that are likely annotation mistakes (e.g. a
   stray click), without modifying anything.
-- **Soporte real de formato COPC** (Cloud Optimized Point Cloud) —
+- **Real COPC format support** (Cloud Optimized Point Cloud) —
   `.copc.laz` files are now recognized and labeled as such in the file
   info, and load correctly end-to-end. (An earlier attempt assumed a COPC
   file could be read through the same code path as a regular LAZ file
@@ -69,7 +69,7 @@ All notable changes to GeoAnnotate3D are documented here. Format loosely follows
   mapping each one by hand via the per-row "++ Crear clase nueva" option.
   Useful for files with many vendor-specific codes (e.g. ASPRS's reserved
   64-255 range) that GeoAnnotate3D can't name automatically.
-- **Exportación incremental a un mismo dataset** — exporting to a folder
+- **Incremental export into the same dataset** — exporting to a folder
   that already holds a previous export (from a different point cloud) now
   adds to it instead of overwriting it: tile files are tagged with their
   source cloud so they never collide, and `dataset.json` merges tile counts,
@@ -77,7 +77,7 @@ All notable changes to GeoAnnotate3D are documented here. Format loosely follows
   folder, tracking all of their source files. Lets you build one larger
   training dataset by annotating and exporting several point clouds one at
   a time into the same output folder.
-- **Fine-tuning desde checkpoint externo** (Paso 5 — Entrenar) — starts a
+- **Fine-tuning from an external checkpoint** (Paso 5 — Entrenar) — starts a
   new training run seeded with another checkpoint's weights (matched by
   layer name and shape; whatever doesn't match, typically the final
   classification layer when the class count differs, is left randomly
@@ -92,20 +92,20 @@ All notable changes to GeoAnnotate3D are documented here. Format loosely follows
   package.
 
 ### Changed
-- **Panel de herramientas (derecha)** — redesigned: tool icons are a bit
+- **Tool panel (right side)** — redesigned: tool icons are a bit
   smaller by default and now resize responsively (both icon size and column
   count) as you resize the panel, so tools never scroll out of view in a
   narrow panel or leave dead space in a wide one. The panel can now be
   widened further than before. The whole panel content also scrolls when a
   tool's options don't fit the available height, instead of the layout being
   crushed together.
-- **Panel de tiles (navegación de nube)** — the view-mode, camera, and grid
+- **Tile panel (cloud navigation)** — the view-mode, camera, and grid
   edit-mode buttons now show text labels instead of icon-only buttons, so
   it's clear at a glance how to return to the overview, switch to maximum
   density, set a top-down view, or move/rotate the tile grid.
 
 ### Fixed
-- **Bug de índices en nubes "heavy" (>150M pts)** — the octree built for
+- **Index bug in "heavy" clouds (>150M pts)** — the octree built for
   clouds loaded via `.ga3d_bin`/"cargar como normal" pre-subsampled the
   point array before indexing it, so Pincel/Esfera/Disco could paint the
   wrong points on very large clouds. The octree now always indexes the full
