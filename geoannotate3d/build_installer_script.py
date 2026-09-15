@@ -68,7 +68,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crear acceso directo en el escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked
-Name: "startmenuicon"; Description: "Crear acceso directo en el menú inicio"; GroupDescription: "Accesos directos:"; Flags: checked
+Name: "startmenuicon"; Description: "Crear acceso directo en el menú inicio"; GroupDescription: "Accesos directos:"
 
 [Files]
 ; Ejecutable principal (Nuitka standalone onefile)
