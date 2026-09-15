@@ -52,7 +52,7 @@ DefaultGroupName={{#MyAppName}}
 AllowNoIcons=yes
 LicenseFile=
 OutputDir={OUTPUT_DIR}
-OutputBaseFilename=GeoAnnotate3D_Setup
+OutputBaseFilename=GeoAnnotate3D_Setup_v{APP_VER}
 SetupIconFile={APP_ICON}
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -102,4 +102,4 @@ out = Path("installer_setup.iss")
 out.write_text(iss, encoding="utf-8")
 print(f"[OK] Generado: {out.resolve()}")
 print(f"     Fuente:   {EXE_SRC}")
-print(f"     Salida:   {OUTPUT_DIR}\\GeoAnnotate3D_Setup.exe")
+print(f"     Salida:   {OUTPUT_DIR}\\GeoAnnotate3D_Setup_v{APP_VER}.exe")

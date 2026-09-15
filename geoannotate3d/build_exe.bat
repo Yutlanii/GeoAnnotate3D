@@ -5,7 +5,7 @@ REM  GeoAnnotate3D — Build Script v2.0 (Nuitka + Inno Setup)
 REM
 REM  Genera:
 REM    dist\GeoAnnotate3D.exe        (ejecutable standalone onefile)
-REM    installer\GeoAnnotate3D_Setup.exe  (instalador Windows)
+REM    installer\GeoAnnotate3D_Setup_v1.0.0.exe  (instalador Windows)
 REM
 REM  Requisitos:
 REM    - Python 3.11 64-bit  (https://python.org)
@@ -173,7 +173,7 @@ if errorlevel 1 (
     echo [WARN] No se pudo generar el instalador.
     goto :done
 )
-echo       Instalador: installer\GeoAnnotate3D_Setup.exe
+echo       Instalador: installer\GeoAnnotate3D_Setup_v1.0.0.exe
 
 :done
 echo.
