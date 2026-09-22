@@ -58,7 +58,7 @@ class _FastCore:
         self._fc = fc_module
         self.available = fc_module is not None
         if self.available:
-            print("[GeoAnnotate3D] _fastcore C engine loaded ✓")
+            print("[GeoAnnotate3D] _fastcore C engine loaded OK")
         else:
             print("[GeoAnnotate3D] _fastcore not available — numpy fallback")
 

@@ -2999,5 +2999,5 @@ if __name__ == "__main__":
             print(f"  - {f}")
         sys.exit(1)
     else:
-        print("RESULTADO: todas las verificaciones pasaron ✓")
+        print("RESULTADO: todas las verificaciones pasaron OK")
         sys.exit(0)

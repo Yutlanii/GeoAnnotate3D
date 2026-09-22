@@ -8,6 +8,24 @@ Usage:
 import sys
 import os
 
+# La consola del .exe empaquetado (Nuitka --windows-console-mode=force, o
+# cualquier conhost.exe en modo legado) usa por defecto el codepage local
+# de Windows (cp1252 en máquinas en español), NO UTF-8. Varios print() del
+# proyecto usan caracteres como '✓' — confirmado en la práctica: eso
+# crasheaba la app entera al arrancar con
+# "UnicodeEncodeError: 'charmap' codec can't encode character '✓'"
+# en cuanto se importaba core/_fast.py, mucho antes de llegar a mostrar
+# ninguna ventana. errors='replace' evita que CUALQUIER print con un
+# carácter no representable vuelva a tumbar la app (se ve como '?' en
+# vez de crashear), sin depender de encontrar y limpiar cada print() a
+# mano uno por uno.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont

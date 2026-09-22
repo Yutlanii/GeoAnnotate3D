@@ -24,6 +24,14 @@ nuitka-crash-report.xml
 installer_setup.iss
 build_cache/
 installer/
+build_env/
+_run_build.bat
+*.log
+build_run.log
+exe_test.log
+exe_final_test.log
+screenshot_check.png
+screenshot_final.png
 
 # Point-cloud cache files generated at runtime (mmap caches, LOD caches)
 *.xyzcache

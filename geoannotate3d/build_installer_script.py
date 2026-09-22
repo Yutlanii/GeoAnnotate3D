@@ -13,7 +13,14 @@ Inno Setup 6 crea un instalador profesional con:
 """
 from pathlib import Path
 
-EXE_SRC   = r"dist\GeoAnnotate3D.exe"
+# DIST_DIR: carpeta --standalone completa (no un .exe --onefile). El
+# payload comprimido de esta app (PyTorch+CUDA+VTK, ~2.28 GB) supera el
+# límite de 2 GB del linker de MSVC para el modo --onefile de Nuitka
+# (LNK1248, confirmado en la práctica), así que el instalador empaqueta
+# la carpeta completa en vez de un solo .exe autoextraíble — el usuario
+# final sigue descargando y corriendo un único .exe (este instalador),
+# Inno Setup solo se encarga de comprimir/descomprimir la carpeta.
+DIST_DIR   = r"dist\main.dist"
 OUTPUT_DIR = r"installer"
 APP_NAME   = "GeoAnnotate3D"
 APP_VER    = "1.0.0"
@@ -22,10 +29,10 @@ APP_URL    = "https://github.com/Yutlanii/GeoAnnotate3D"
 APP_ICON   = r"ui\icon.ico"
 APP_EXE    = "GeoAnnotate3D.exe"
 
-# Verificar que el exe existe
-if not Path(EXE_SRC).exists():
-    print(f"[ERROR] No se encontró {EXE_SRC}")
-    print("        Ejecuta build_exe.bat primero para compilar el ejecutable.")
+# Verificar que la carpeta standalone y su ejecutable existen
+if not (Path(DIST_DIR) / APP_EXE).exists():
+    print(f"[ERROR] No se encontró {DIST_DIR}\\{APP_EXE}")
+    print("        Ejecuta build_exe.bat primero para compilar el standalone.")
     raise SystemExit(1)
 
 iss = f"""
@@ -71,8 +78,12 @@ Name: "desktopicon"; Description: "Crear acceso directo en el escritorio"; Group
 Name: "startmenuicon"; Description: "Crear acceso directo en el menú inicio"; GroupDescription: "Accesos directos:"
 
 [Files]
-; Ejecutable principal (Nuitka standalone onefile)
-Source: "{EXE_SRC}"; DestDir: "{{app}}"; Flags: ignoreversion
+; Carpeta standalone completa (Nuitka --standalone, sin --onefile — ver
+; el comentario junto a DIST_DIR arriba). recursesubdirs+createallsubdirs
+; copia todo el árbol tal cual; ignoreversion evita que Inno Setup se
+; salte archivos por comparación de versión (no todos son .exe/.dll con
+; versión embebida).
+Source: "{DIST_DIR}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 ; Menú inicio
@@ -101,5 +112,5 @@ end;
 out = Path("installer_setup.iss")
 out.write_text(iss, encoding="utf-8")
 print(f"[OK] Generado: {out.resolve()}")
-print(f"     Fuente:   {EXE_SRC}")
+print(f"     Fuente:   {DIST_DIR}\\ (carpeta completa)")
 print(f"     Salida:   {OUTPUT_DIR}\\GeoAnnotate3D_Setup_v{APP_VER}.exe")

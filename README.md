@@ -118,7 +118,7 @@ The installer bundles Python, PyTorch (CUDA build), and every dependency needed 
 **System Requirements:**
 - Windows 10/11 (64-bit)
 - 8 GB RAM minimum (16 GB recommended)
-- ~6 GB disk space
+- ~8 GB disk space (bundles PyTorch, CUDA runtime, and VTK unpacked, not compressed)
 - NVIDIA GPU with CUDA 12.x (optional — accelerates training; the app runs on CPU otherwise, just slower)
 
 ---

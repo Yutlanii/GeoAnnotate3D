@@ -2180,7 +2180,7 @@ class MainWindow(QMainWindow):
                 self._tool_panel.set_color_mode("Anotación")
             self._canvas._req_worker()
             self._on_stats_changed()
-            print(f"[Project] Modo Anotación activo ({n_labeled:,} pts) ✓")
+            print(f"[Project] Modo Anotación activo ({n_labeled:,} pts) OK")
         except Exception as e:
             print(f"[Project] Error: {e}")
 

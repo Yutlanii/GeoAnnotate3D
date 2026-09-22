@@ -31,7 +31,7 @@ def build_fastcore(force=False):
     # Method 1: setuptools
     try:
         _build_setuptools(src)
-        print("[fastcore] Compilado OK ✓")
+        print("[fastcore] Compilado OK")
         return True
     except Exception as e1:
         print(f"[fastcore] setuptools: {e1}")
@@ -39,7 +39,7 @@ def build_fastcore(force=False):
     # Method 2: gcc directo
     try:
         _build_gcc(src, HERE / "_fastcore.so")
-        print("[fastcore] gcc OK ✓")
+        print("[fastcore] gcc OK")
         return True
     except Exception as e2:
         print(f"[fastcore] gcc: {e2}")
