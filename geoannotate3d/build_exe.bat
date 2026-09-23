@@ -160,6 +160,17 @@ REM  en tests, pero alguna dependencia (numpy/matplotlib/h5py) importa
 REM  unittest.mock de verdad en tiempo de ejecución — confirmado en la
 REM  práctica, crasheaba con "IMPORT_HARD_UNITTEST__MOCK: Unexpected
 REM  failure of hard import of 'unittest.mock'" apenas arrancaba.
+REM
+REM  --nofollow-import-to=open3d/dash/plotly/jedi/IPython: open3d es
+REM  opcional (core/pointcloud.py lo importa en un try/except ImportError
+REM  con un parser manual de respaldo para PLY) pero Nuitka lo seguía y
+REM  empaquetaba igual, junto con TODO lo que open3d arrastra (dash,
+REM  plotly, jedi/IPython del lado Jupyter) — ~229 MB muertos que nadie
+REM  usa. Con GitHub limitando los assets de Release a 2 GiB por archivo
+REM  y el instalador dando 2.045 GiB (confirmado, justo por encima),
+REM  esto es lo que lo baja a un tamaño publicable sin tocar ninguna
+REM  funcionalidad real: sin estas librerías, "import open3d" simplemente
+REM  falla en runtime como ya está previsto, y se usa el parser manual.
 python -m nuitka ^
   --standalone ^
   --windows-console-mode=disable ^
@@ -202,6 +213,11 @@ python -m nuitka ^
   --include-data-dir=core=core ^
   --include-data-dir=ui\icons=ui\icons ^
   --include-data-files=ui\splash_bg.png=ui\splash_bg.png ^
+  --nofollow-import-to=open3d ^
+  --nofollow-import-to=dash ^
+  --nofollow-import-to=plotly ^
+  --nofollow-import-to=jedi ^
+  --nofollow-import-to=IPython ^
   --python-flag=no_site ^
   --python-flag=no_warnings ^
   --assume-yes-for-downloads ^
